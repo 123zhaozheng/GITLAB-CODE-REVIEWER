@@ -1,0 +1,160 @@
+# GitLab Code Reviewer - Docker Compose配置
+# 用于本地开发和部署
+
+version: '3.8'
+
+services:
+  # 主要的代码审查服务
+  reviewer-api:
+    build: .
+    container_name: gitlab-code-reviewer
+    ports:
+      - "8000:8000"
+    environment:
+      # 从环境变量或.env文件读取
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - OPENAI_API_BASE=${OPENAI_API_BASE}
+      - OPENAI_API_URL=${OPENAI_API_URL}
+      - AI_PROVIDER=${AI_PROVIDER:-openai}
+      - CUSTOM_LLM_PROVIDER=${CUSTOM_LLM_PROVIDER}
+      - DEFAULT_AI_MODEL=${DEFAULT_AI_MODEL:-gpt-4}
+      - FALLBACK_AI_MODEL=${FALLBACK_AI_MODEL:-gpt-3.5-turbo}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - DEBUG=${DEBUG:-false}
+      - REDIS_URL=redis://redis:6379/0
+      - DATABASE_URL=postgresql://reviewer:password@postgres:5432/reviewer_db
+    volumes:
+      - ./logs:/app/logs
+      - ./.env:/app/.env:ro
+    depends_on:
+      - redis
+      - postgres
+    restart: unless-stopped
+    networks:
+      - reviewer-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  # Redis缓存服务
+  redis:
+    image: redis:7-alpine
+    container_name: reviewer-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes --maxmemory 512mb --maxmemory-policy allkeys-lru
+    restart: unless-stopped
+    networks:
+      - reviewer-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  # PostgreSQL数据库（可选，用于存储审查历史）
+  postgres:
+    image: postgres:15-alpine
+    container_name: reviewer-postgres
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_DB: reviewer_db
+      POSTGRES_USER: reviewer
+      POSTGRES_PASSWORD: password
+      POSTGRES_INITDB_ARGS: "--encoding=UTF-8"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./deployment/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    restart: unless-stopped
+    networks:
+      - reviewer-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U reviewer -d reviewer_db"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  # Nginx反向代理（生产环境）
+  nginx:
+    image: nginx:alpine
+    container_name: reviewer-nginx
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./deployment/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./deployment/ssl:/etc/nginx/ssl:ro
+      - ./logs/nginx:/var/log/nginx
+    depends_on:
+      - reviewer-api
+    restart: unless-stopped
+    networks:
+      - reviewer-network
+    profiles:
+      - production
+
+  # Prometheus监控（可选）
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: reviewer-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./deployment/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+      - '--web.enable-lifecycle'
+    restart: unless-stopped
+    networks:
+      - reviewer-network
+    profiles:
+      - monitoring
+
+  # Grafana仪表板（可选）
+  grafana:
+    image: grafana/grafana:latest
+    container_name: reviewer-grafana
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./deployment/grafana:/etc/grafana/provisioning
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+    networks:
+      - reviewer-network
+    profiles:
+      - monitoring
+
+# 数据卷定义
+volumes:
+  redis_data:
+    driver: local
+  postgres_data:
+    driver: local
+  prometheus_data:
+    driver: local
+  grafana_data:
+    driver: local
+
+# 网络定义
+networks:
+  reviewer-network:
+    driver: bridge
+    ipam:
+      driver: default
+      config:
+        - subnet: 172.20.0.0/16
