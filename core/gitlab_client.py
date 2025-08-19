@@ -5,7 +5,6 @@ GitLab客户端模块
 import asyncio
 import aiohttp
 from typing import Dict, List, Optional, Tuple, Any
-from functools import lru_cache
 import gitlab
 from urllib.parse import urlparse
 import logging
@@ -50,7 +49,6 @@ class GitLabClient:
         if self._session:
             await self._session.close()
     
-    @lru_cache(maxsize=128)
     async def get_mr_basic_info(self, project_id: str, mr_id: int) -> Dict[str, Any]:
         """获取MR基本信息 - 带缓存"""
         cache_key = f"mr_basic_{project_id}_{mr_id}"

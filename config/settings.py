@@ -29,7 +29,6 @@ class Settings(BaseSettings):
     
     # OpenAI兼容服务配置
     ai_provider: str = Field(default="openai", env="AI_PROVIDER")  # openai, azure, custom等
-    custom_llm_provider: Optional[str] = Field(default=None, env="CUSTOM_LLM_PROVIDER")  # litellm支持的自定义provider
     
     # 数据库配置
     database_url: str = Field(default="sqlite:///./app.db", env="DATABASE_URL")
@@ -53,6 +52,13 @@ class Settings(BaseSettings):
     enable_cost_optimization: bool = Field(default=True, env="ENABLE_COST_OPTIMIZATION")
     max_cost_per_review: float = Field(default=0.50, env="MAX_COST_PER_REVIEW")
     smart_filtering: bool = Field(default=True, env="SMART_FILTERING")
+    
+    # LiteLLM兼容配置 (用于向后兼容)
+    litellm_model_config: Optional[Dict[str, Any]] = None
+    
+    # 结构化输出配置
+    enable_structured_output: bool = Field(default=True, env="ENABLE_STRUCTURED_OUTPUT")
+    force_structured_output: bool = Field(default=False, env="FORCE_STRUCTURED_OUTPUT")
 
     def __init__(self, **kwargs):
         """初始化设置，手动处理allowed_hosts环境变量"""
@@ -89,22 +95,7 @@ class Settings(BaseSettings):
         """获取API基础URL，支持多种配置方式"""
         return self.openai_api_url or self.openai_api_base
     
-    @property 
-    def litellm_model_config(self) -> Dict[str, str]:
-        """获取litellm模型配置"""
-        config = {}
-        
-        if self.api_base_url:
-            config["api_base"] = self.api_base_url
-            
-        if self.openai_api_key:
-            config["api_key"] = self.openai_api_key
-            
-        if self.custom_llm_provider:
-            config["custom_llm_provider"] = self.custom_llm_provider
-            
-        return config
-
+    
     model_config = {
         "env_file": "../.env",
         "case_sensitive": False

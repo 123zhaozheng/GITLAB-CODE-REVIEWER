@@ -18,7 +18,7 @@ def check_dependencies():
         import uvicorn
         import aiohttp
         import gitlab
-        import litellm
+        import openai
         print("✅ Python依赖检查通过")
         return True
     except ImportError as e:

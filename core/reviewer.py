@@ -9,7 +9,7 @@ from datetime import datetime
 import uuid
 
 from core.gitlab_client import GitLabClient, FilePatchInfo
-from core.ai_processor import AIProcessor
+from core.simple_ai_processor import SimpleAIProcessor
 from config.settings import settings, REVIEW_TYPES
 
 logger = logging.getLogger(__name__)
@@ -39,7 +39,7 @@ class GitLabReviewer:
         
         # 初始化客户端
         self.gitlab_client = GitLabClient(gitlab_url, access_token)
-        self.ai_processor = AIProcessor(self.ai_model)
+        self.ai_processor = SimpleAIProcessor(self.ai_model)
         
         # 审查状态追踪
         self.active_reviews = {}
