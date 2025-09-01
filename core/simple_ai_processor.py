@@ -5,6 +5,7 @@
 import asyncio
 import json
 import re
+import time
 from typing import Dict, List, Optional, Any
 import tiktoken
 import openai
@@ -356,6 +357,7 @@ class SimpleAIProcessor:
         logger.info(f"  - 文件数量: {len(diff_files)}")
         logger.info(f"  - AI模型: {self.model}")
         logger.info(f"  - AI客户端可用: {self._is_ai_available()}")
+        logger.info(f"  - 逐文件审查: {settings.enable_per_file_review}")
         
         logger.info(f"📁 变更文件列表:")
         for i, file_patch in enumerate(diff_files):
@@ -369,8 +371,10 @@ class SimpleAIProcessor:
         try:
             logger.info(f"⚡ 开始执行 {review_type} 类型审查...")
             
-            # 根据审查类型选择分析策略
-            if review_type == "security":
+            # 根据审查类型和配置选择分析策略
+            if settings.enable_per_file_review and len(diff_files) > 1:
+                result = await self._per_file_analysis(diff_files, review_type, mr_info)
+            elif review_type == "security":
                 result = await self._security_focused_analysis(diff_files, mr_info)
             elif review_type == "performance":
                 result = await self._performance_focused_analysis(diff_files, mr_info)
@@ -446,6 +450,331 @@ class SimpleAIProcessor:
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         """异步上下文管理器出口"""
         await self._cleanup_client()
+    
+    async def _per_file_analysis(self, diff_files: List[FilePatchInfo], 
+                               review_type: str, mr_info: Dict) -> Dict[str, Any]:
+        """逐文件并行分析 - 新的核心方法"""
+        logger.info(f"🚀 启动逐文件并行分析，文件数量: {len(diff_files)}")
+        logger.info(f"🔧 最大并发数: {settings.max_concurrent_file_reviews}")
+        
+        # 使用信号量控制并发数
+        semaphore = asyncio.Semaphore(settings.max_concurrent_file_reviews)
+        
+        async def analyze_single_file(file_patch: FilePatchInfo) -> Dict[str, Any]:
+            async with semaphore:
+                return await self._analyze_single_file(file_patch, review_type)
+        
+        # 并行处理所有文件
+        start_time = time.time()
+        tasks = [analyze_single_file(file_patch) for file_patch in diff_files]
+        file_results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        parallel_time = time.time() - start_time
+        logger.info(f"⚡ 并行文件分析完成，耗时: {parallel_time:.2f}秒")
+        
+        # 聚合结果
+        all_findings = []
+        all_suggestions = []
+        failed_files = []
+        
+        for i, result in enumerate(file_results):
+            if isinstance(result, Exception):
+                logger.error(f"文件 {diff_files[i].filename} 分析失败: {result}")
+                failed_files.append(diff_files[i].filename)
+                continue
+            
+            all_findings.extend(result.get("findings", []))
+            all_suggestions.extend(result.get("suggestions", []))
+        
+        # 生成全局总结
+        global_summary = await self._generate_global_summary(
+            all_findings, all_suggestions, mr_info, failed_files
+        )
+        
+        # 计算整体评分
+        score = self._calculate_overall_score(all_findings, diff_files, failed_files)
+        
+        logger.info(f"📊 逐文件分析完成:")
+        logger.info(f"  - 成功分析文件: {len(diff_files) - len(failed_files)}")
+        logger.info(f"  - 失败文件: {len(failed_files)}")
+        logger.info(f"  - 总问题数: {len(all_findings)}")
+        logger.info(f"  - 总建议数: {len(all_suggestions)}")
+        
+        return {
+            "type": f"{review_type}_per_file",
+            "findings": all_findings[:30],  # 限制数量防止结果过大
+            "suggestions": all_suggestions[:20],
+            "recommendations": self._generate_recommendations(all_findings),
+            "score": score,
+            "summary": global_summary,
+            "failed_files": failed_files,
+            "parallel_analysis_time": parallel_time
+        }
+    
+    async def _analyze_single_file(self, file_patch: FilePatchInfo, 
+                                 review_type: str) -> Dict[str, Any]:
+        """分析单个文件"""
+        import time
+        
+        start_time = time.time()
+        logger.info(f"📄 开始分析文件: {file_patch.filename}")
+        
+        try:
+            # 基础问题检测（本地，快速）
+            basic_issues = self._detect_basic_issues(file_patch)
+            
+            # 构建完整文件内容用于AI分析
+            full_file_content = self._prepare_file_content_for_analysis(file_patch)
+            
+            # AI深度分析
+            ai_findings = []
+            ai_suggestions = []
+            
+            if self._is_ai_available() and full_file_content:
+                try:
+                    ai_result = await self._ai_single_file_analysis(
+                        file_patch, full_file_content, review_type
+                    )
+                    ai_findings = ai_result.get("findings", [])
+                    ai_suggestions = ai_result.get("suggestions", [])
+                except Exception as e:
+                    logger.warning(f"文件 {file_patch.filename} 的AI分析失败: {e}")
+            
+            # 合并结果
+            all_findings = basic_issues + ai_findings
+            
+            end_time = time.time()
+            analysis_time = end_time - start_time
+            
+            logger.info(f"✅ 文件 {file_patch.filename} 分析完成 ({analysis_time:.2f}秒)")
+            logger.info(f"    - 基础问题: {len(basic_issues)}个")
+            logger.info(f"    - AI发现问题: {len(ai_findings)}个") 
+            logger.info(f"    - AI建议: {len(ai_suggestions)}个")
+            
+            return {
+                "filename": file_patch.filename,
+                "findings": all_findings,
+                "suggestions": ai_suggestions,
+                "analysis_time": analysis_time
+            }
+            
+        except Exception as e:
+            end_time = time.time()
+            logger.error(f"❌ 文件 {file_patch.filename} 分析失败: {e} ({end_time - start_time:.2f}秒)")
+            raise
+    
+    def _prepare_file_content_for_analysis(self, file_patch: FilePatchInfo) -> str:
+        """准备用于AI分析的文件内容（包含完整内容和diff）"""
+        logger.debug(f"准备文件内容: {file_patch.filename}")
+        
+        # 获取文件内容（优先使用new_content，如果为空则使用old_content）
+        full_content = file_patch.new_content or file_patch.old_content
+        
+        if not full_content:
+            logger.debug(f"文件 {file_patch.filename} 无完整内容，仅使用diff")
+            return file_patch.patch
+        
+        # 按行截断文件内容
+        lines = full_content.splitlines()
+        if len(lines) > settings.max_file_lines:
+            logger.info(f"文件 {file_patch.filename} 行数过多({len(lines)})，截断至{settings.max_file_lines}行")
+            truncated_content = '\n'.join(lines[:settings.max_file_lines])
+            truncated_content += f"\n... [文件被截断，原始行数: {len(lines)}]"
+        else:
+            truncated_content = full_content
+        
+        # 组合完整内容和变更信息
+        content_for_analysis = f"""
+文件: {file_patch.filename}
+变更类型: {file_patch.edit_type}
+
+完整文件内容:
+```
+{truncated_content}
+```
+
+变更详情(diff):
+```diff
+{file_patch.patch}
+```
+"""
+        return content_for_analysis.strip()
+    
+    async def _ai_single_file_analysis(self, file_patch: FilePatchInfo, 
+                                     full_content: str, review_type: str) -> Dict[str, Any]:
+        """对单个文件进行AI分析"""
+        if not self._is_ai_available():
+            return {"findings": [], "suggestions": []}
+        
+        # 根据审查类型构建不同的提示词
+        focus_areas = REVIEW_TYPES.get(review_type, {}).get("focus_areas", ["quality"])
+        focus_description = ", ".join(focus_areas)
+        
+        base_prompt = f"""
+请专门分析以下文件的代码质量，重点关注: {focus_description}
+
+{full_content}
+
+请提供：
+1. 发现的具体问题，包括行号和详细说明
+2. 针对性的改进建议
+3. 评估变更的影响和风险
+
+注意：这是单独文件分析，请专注于该文件本身的问题，而不是整体架构。
+"""
+        
+        # 如果不支持结构化输出，添加JSON格式说明
+        if not self.client._supports_structured_output(self.model):
+            prompt = base_prompt + """
+请严格按照以下JSON格式回复：
+{
+    "findings": [
+        {
+            "type": "问题类型",
+            "line_number": 行号,
+            "severity": "high/medium/low",
+            "description": "问题描述",
+            "suggestion": "修复建议"
+        }
+    ],
+    "suggestions": ["改进建议1", "改进建议2"]
+}
+"""
+        else:
+            prompt = base_prompt
+        
+        try:
+            response = await self.client.chat_completion(
+                messages=[
+                    {"role": "system", "content": "你是一个专业的代码审查专家，专注于单文件代码分析。"},
+                    {"role": "user", "content": prompt}
+                ],
+                model=self.model,
+                temperature=0.2,
+                max_tokens=2000,
+                response_format={
+                    "type": "object",
+                    "properties": {
+                        "findings": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "type": {"type": "string"},
+                                    "line_number": {"type": "integer"},
+                                    "severity": {"type": "string", "enum": ["high", "medium", "low"]},
+                                    "description": {"type": "string"},
+                                    "suggestion": {"type": "string"}
+                                },
+                                "required": ["type", "severity", "description"]
+                            }
+                        },
+                        "suggestions": {
+                            "type": "array",
+                            "items": {"type": "string"}
+                        }
+                    },
+                    "required": ["findings", "suggestions"]
+                }
+            )
+            
+            # 解析响应
+            cleaned_response = self._extract_json_from_response(response)
+            result = json.loads(cleaned_response)
+            
+            # 为每个finding添加filename
+            for finding in result.get("findings", []):
+                finding["filename"] = file_patch.filename
+            
+            return result
+            
+        except Exception as e:
+            logger.error(f"AI单文件分析失败: {e}")
+            return {"findings": [], "suggestions": []}
+    
+    async def _generate_global_summary(self, all_findings: List[Dict], 
+                                     all_suggestions: List[str], mr_info: Dict,
+                                     failed_files: List[str]) -> str:
+        """生成全局分析总结"""
+        if not self._is_ai_available():
+            high_issues = len([f for f in all_findings if f.get("severity") == "high"])
+            medium_issues = len([f for f in all_findings if f.get("severity") == "medium"])
+            return f"逐文件分析完成，发现{high_issues}个高风险问题，{medium_issues}个中等风险问题。"
+        
+        # 统计信息
+        high_issues = len([f for f in all_findings if f.get("severity") == "high"])
+        medium_issues = len([f for f in all_findings if f.get("severity") == "medium"])
+        low_issues = len([f for f in all_findings if f.get("severity") == "low"])
+        
+        # 问题分类统计
+        issue_types = {}
+        for finding in all_findings:
+            issue_type = finding.get("type", "unknown")
+            issue_types[issue_type] = issue_types.get(issue_type, 0) + 1
+        
+        top_issues = sorted(issue_types.items(), key=lambda x: x[1], reverse=True)[:5]
+        
+        prompt = f"""
+请基于以下逐文件代码审查结果，生成一个全局总结：
+
+MR信息：
+- 标题：{mr_info.get('title', '未知')}
+- 源分支：{mr_info.get('source_branch', '未知')}
+- 目标分支：{mr_info.get('target_branch', '未知')}
+
+分析统计：
+- 高风险问题：{high_issues}个
+- 中等风险问题：{medium_issues}个
+- 低风险问题：{low_issues}个
+- 分析失败文件：{len(failed_files)}个
+
+主要问题类型：
+{chr(10).join([f"- {issue_type}: {count}个" for issue_type, count in top_issues])}
+
+改进建议数量：{len(all_suggestions)}个
+
+请生成一个简洁的总结，评估整体代码质量和主要改进方向。
+"""
+        
+        try:
+            response = await self.client.chat_completion(
+                messages=[{"role": "user", "content": prompt}],
+                model=self.model,
+                temperature=0.3,
+                max_tokens=300
+            )
+            return response.strip()
+        except Exception as e:
+            logger.error(f"生成全局总结失败: {e}")
+            return f"逐文件并行分析完成，总共发现{len(all_findings)}个问题，{len(all_suggestions)}个建议。"
+    
+    def _calculate_overall_score(self, all_findings: List[Dict], 
+                               diff_files: List[FilePatchInfo], 
+                               failed_files: List[str]) -> float:
+        """计算整体评分"""
+        base_score = 8.0
+        
+        # 根据问题严重程度扣分
+        for finding in all_findings:
+            severity = finding.get("severity", "low")
+            if severity == "high":
+                base_score -= 1.0
+            elif severity == "medium":
+                base_score -= 0.5
+            else:
+                base_score -= 0.2
+        
+        # 根据失败文件扣分
+        if failed_files:
+            failure_penalty = len(failed_files) * 0.5
+            base_score -= failure_penalty
+            logger.info(f"由于{len(failed_files)}个文件分析失败，扣分{failure_penalty}")
+        
+        # 根据文件数量调整
+        if len(diff_files) > 10:
+            base_score -= 0.3
+        
+        return max(base_score, 2.0)  # 最低2分
     
     async def _comprehensive_analysis(self, diff_files: List[FilePatchInfo], 
                                     mr_info: Dict) -> Dict[str, Any]:

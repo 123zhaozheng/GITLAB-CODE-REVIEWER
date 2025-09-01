@@ -43,6 +43,11 @@ class Settings(BaseSettings):
     default_gitlab_url: str = Field(default="https://gitlab.com", env="DEFAULT_GITLAB_URL")
     max_files_per_review: int = Field(default=50, env="MAX_FILES_PER_REVIEW")
     
+    # 文件内容处理配置
+    max_file_lines: int = Field(default=1000, env="MAX_FILE_LINES")
+    enable_per_file_review: bool = Field(default=True, env="ENABLE_PER_FILE_REVIEW")
+    max_concurrent_file_reviews: int = Field(default=5, env="MAX_CONCURRENT_FILE_REVIEWS")
+    
     # 安全配置
     api_key_header: str = Field(default="X-API-Key", env="API_KEY_HEADER")
     rate_limit_per_minute: int = Field(default=60, env="RATE_LIMIT_PER_MINUTE")
