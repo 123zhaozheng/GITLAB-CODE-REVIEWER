@@ -166,6 +166,52 @@ class GitLabClient:
             logger.error(f"Failed to get diff files for MR {mr_id}: {e}")
             raise
     
+    async def compare_branches(self, project_id: str, target_branch: str, source_branch: str) -> List[FilePatchInfo]:
+        """比较两个分支并获取差异文件列表"""
+        logger.info(f"Comparing branches: '{source_branch}' vs '{target_branch}'")
+        try:
+            project = self.gitlab.projects.get(project_id)
+            # straight=True 表示我们想要两个分支端点之间的直接比较（相当于 git diff target...source）
+            comparison = project.repository_compare(from_=target_branch, to=source_branch, straight=True)
+            diffs = comparison.get('diffs', [])
+
+            if not diffs:
+                logger.warning(f"No differences found between '{source_branch}' and '{target_branch}'")
+                return []
+
+            filtered_diffs = self._filter_relevant_files(diffs)
+
+            # 我们可以复用 _create_file_patch_info，只需提供正确的 "refs"
+            # 在这种情况下，"base" 是目标分支，"head" 是源分支
+            diff_refs = {'base_sha': target_branch, 'head_sha': source_branch}
+
+            tasks = [self._create_file_patch_info(project_id, diff, diff_refs) for diff in filtered_diffs]
+
+            # 使用与 get_diff_files 中相同的并发限制逻辑
+            semaphore = asyncio.Semaphore(10)
+            async def limited_task(task):
+                async with semaphore:
+                    return await task
+            
+            results = await asyncio.gather(
+                *[limited_task(task) for task in tasks],
+                return_exceptions=True
+            )
+            
+            file_patches = []
+            for result in results:
+                if isinstance(result, FilePatchInfo):
+                    file_patches.append(result)
+                elif isinstance(result, Exception):
+                    logger.error(f"Error processing file during branch compare: {result}")
+
+            logger.info(f"Successfully processed {len(file_patches)} files from branch comparison.")
+            return file_patches
+
+        except Exception as e:
+            logger.error(f"Failed to compare branches '{source_branch}' and '{target_branch}': {e}")
+            raise
+
     async def _create_file_patch_info(self, project_id: str, change: Dict, diff_refs: Dict) -> FilePatchInfo:
         """创建单个文件的补丁信息"""
         try:

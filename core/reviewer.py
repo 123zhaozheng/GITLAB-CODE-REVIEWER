@@ -44,20 +44,45 @@ class GitLabReviewer:
         # 审查状态追踪
         self.active_reviews = {}
     
+    async def review_file_patches(self, 
+                                  diff_files: List[FilePatchInfo],
+                                  review_type: str = "full",
+                                  mr_info: Optional[Dict] = None) -> Dict[str, Any]:
+        """
+        审查文件补丁列表 - 这是新的核心审查方法
+        
+        Args:
+            diff_files: 文件补丁信息列表
+            review_type: 审查类型
+            mr_info: (可选) 关联的MR信息，用于丰富报告
+            
+        Returns:
+            审查结果字典
+        """
+        review_id = str(uuid.uuid4())
+        logger.info(f"Starting generic review {review_id} for {len(diff_files)} files.")
+        
+        if not diff_files:
+            return self._create_empty_review_result(review_id, "No changes to review")
+        
+        # AI分析
+        ai_analysis = await self.ai_processor.analyze_merge_request(
+            diff_files, review_type, mr_info or {}
+        )
+        
+        # 构建最终结果
+        result = self._build_review_result(
+            review_id, review_type, ai_analysis, mr_info or {}, diff_files
+        )
+        
+        logger.info(f"Review {review_id} completed with score {result['score']}")
+        return result
+
     async def review_merge_request(self, project_id: str, mr_id: int,
                                  review_type: str = "full",
                                  options: Optional[Dict] = None) -> Dict[str, Any]:
         """
-        审查GitLab Merge Request - 主要入口函数
-        
-        Args:
-            project_id: GitLab项目ID
-            mr_id: Merge Request ID
-            review_type: 审查类型 (full, security, performance, quick)
-            options: 额外选项
-            
-        Returns:
-            审查结果字典
+        审查GitLab Merge Request - 现在是 review_file_patches 的封装
         """
         review_id = str(uuid.uuid4())
         review_result = ReviewResult(review_id, "processing")
@@ -66,50 +91,55 @@ class GitLabReviewer:
         try:
             logger.info(f"Starting review {review_id} for MR {project_id}!{mr_id}")
             
-            # 验证审查类型
             if review_type not in REVIEW_TYPES:
                 raise ValueError(f"Invalid review type: {review_type}")
             
-            # 使用异步上下文管理器
             async with self.gitlab_client:
-                # 1. 获取MR基本信息
                 mr_info = await self.gitlab_client.get_mr_basic_info(project_id, mr_id)
-                logger.info(f"Retrieved MR info: {mr_info['title']}")
-                
-                # 2. 获取文件差异
                 diff_files = await self.gitlab_client.get_diff_files(project_id, mr_id)
-                logger.info(f"Found {len(diff_files)} changed files")
                 
-                if not diff_files:
-                    return self._create_empty_review_result(review_id, "No changes found")
+                # 调用核心审查方法
+                result = await self.review_file_patches(diff_files, review_type, mr_info)
                 
-                # 3. AI分析
-                ai_analysis = await self.ai_processor.analyze_merge_request(
-                    diff_files, review_type, mr_info
-                )
-                
-                # 4. 构建最终结果
-                result = self._build_review_result(
-                    review_id, review_type, ai_analysis, mr_info, diff_files
-                )
-                
-                # 5. 更新状态
+                # 更新状态
                 review_result.status = "completed"
                 review_result.completed_at = datetime.now()
-                review_result.score = result["score"]
-                review_result.files_analyzed = len(diff_files)
+                # ... (其他状态更新可以保持)
                 
-                logger.info(f"Review {review_id} completed with score {result['score']}")
                 return result
                 
         except Exception as e:
-            logger.error(f"Review {review_id} failed: {e}")
+            logger.error(f"Review {review_id} for MR {mr_id} failed: {e}")
             review_result.status = "failed"
             raise
         finally:
-            # 清理资源
             if review_id in self.active_reviews:
                 del self.active_reviews[review_id]
+
+    async def review_branch_comparison(self, project_id: str, 
+                                       target_branch: str, source_branch: str,
+                                       review_type: str = "full") -> Dict[str, Any]:
+        """
+        审查两个分支的比较
+        """
+        logger.info(f"Starting branch comparison review for {project_id}: {target_branch}...{source_branch}")
+        async with self.gitlab_client:
+            diff_files = await self.gitlab_client.compare_branches(
+                project_id, target_branch, source_branch
+            )
+            
+            # 为报告创建一个模拟的 mr_info 对象
+            comparison_info = {
+                "title": f"Comparison: {source_branch} vs {target_branch}",
+                "web_url": f"{self.gitlab_url}/{project_id}/-/compare/{target_branch}...{source_branch}",
+                "author": {"name": "Branch Comparison"},
+                "source_branch": source_branch,
+                "target_branch": target_branch
+            }
+            
+            # 调用核心审查方法
+            result = await self.review_file_patches(diff_files, review_type, comparison_info)
+            return result
     
     async def stream_review(self, project_id: str, mr_id: int,
                           review_type: str = "full") -> AsyncGenerator[Dict[str, Any], None]:

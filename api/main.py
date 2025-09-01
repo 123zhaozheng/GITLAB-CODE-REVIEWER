@@ -42,11 +42,21 @@ app.add_middleware(
 
 # Pydantic模型定义
 class ReviewRequest(BaseModel):
-    """审查请求模型"""
+    """审查请求模型 - 支持MR和分支比较模式"""
     gitlab_url: str = Field(..., description="GitLab实例URL")
     project_id: str = Field(..., description="项目ID") 
-    mr_id: int = Field(..., gt=0, description="Merge Request ID")
     access_token: str = Field(..., description="GitLab访问令牌")
+    
+    # 模式选择
+    mode: str = Field(default="mr", description="审查模式: 'mr' 或 'branch_compare'")
+    
+    # MR模式所需参数
+    mr_id: Optional[int] = Field(default=None, gt=0, description="Merge Request ID (mode='mr'时必需)")
+    
+    # 分支比较模式所需参数
+    target_branch: Optional[str] = Field(default=None, description="目标分支 (mode='branch_compare'时必需)")
+    source_branch: Optional[str] = Field(default=None, description="源分支 (mode='branch_compare'时必需)")
+
     review_type: str = Field(default="full", description="审查类型")
     ai_model: Optional[str] = Field(default=None, description="AI模型名称")
     options: Optional[Dict[str, Any]] = Field(default_factory=dict, description="额外选项")
@@ -157,16 +167,35 @@ async def review_merge_request(
     这是主要的审查接口，支持同步返回完整的审查结果。
     """
     try:
-        logger.info(f"Starting review for MR {request.project_id}!{request.mr_id}")
+        logger.info(f"Starting review for project {request.project_id}")
         
-        # 执行审查
-        result = await reviewer.review_merge_request(
-            project_id=request.project_id,
-            mr_id=request.mr_id,
-            review_type=request.review_type,
-            options=request.options
-        )
+        if request.mode == "mr":
+            if not request.mr_id:
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="mr_id is required for 'mr' mode")
+            
+            logger.info(f"Mode: MR review for !{request.mr_id}")
+            result = await reviewer.review_merge_request(
+                project_id=request.project_id,
+                mr_id=request.mr_id,
+                review_type=request.review_type,
+                options=request.options
+            )
         
+        elif request.mode == "branch_compare":
+            if not request.target_branch or not request.source_branch:
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="target_branch and source_branch are required for 'branch_compare' mode")
+            
+            logger.info(f"Mode: Branch comparison between '{request.source_branch}' and '{request.target_branch}'")
+            result = await reviewer.review_branch_comparison(
+                project_id=request.project_id,
+                target_branch=request.target_branch,
+                source_branch=request.source_branch,
+                review_type=request.review_type
+            )
+            
+        else:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Invalid mode: '{request.mode}'. Must be 'mr' or 'branch_compare'.")
+
         logger.info(f"Review completed with score {result['score']}")
         return ReviewResponse(**result)
         

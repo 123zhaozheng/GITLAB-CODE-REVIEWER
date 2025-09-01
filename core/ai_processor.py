@@ -7,7 +7,6 @@ import json
 import re
 from typing import Dict, List, Optional, Any, AsyncGenerator
 import tiktoken
-from litellm import acompletion
 import logging
 
 from config.settings import settings, MODEL_COSTS, REVIEW_TYPES
