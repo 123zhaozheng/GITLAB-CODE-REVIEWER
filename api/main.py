@@ -88,14 +88,6 @@ class ReviewResponse(BaseModel):
     statistics: Dict[str, Any] = Field(default_factory=dict)
     metadata: Dict[str, Any] = Field(default_factory=dict)
 
-class CommentRequest(BaseModel):
-    """评论请求模型"""
-    gitlab_url: str
-    project_id: str
-    mr_id: int = Field(gt=0)
-    access_token: str
-    review_result: Dict[str, Any]
-    format_type: str = Field(default="markdown", pattern="^(markdown|plain)$")
 
 class HealthResponse(BaseModel):
     """健康检查响应"""
@@ -256,38 +248,6 @@ async def stream_review(request: ReviewRequest):
             detail=f"Stream review failed: {str(e)}"
         )
 
-@app.post("/review/comment")
-async def post_review_comment(request: CommentRequest):
-    """
-    将审查结果发布为MR评论
-    
-    用于将审查结果自动发布到GitLab MR中。
-    """
-    try:
-        reviewer = GitLabReviewer(
-            gitlab_url=request.gitlab_url,
-            access_token=request.access_token
-        )
-        
-        comment_info = await reviewer.post_review_comment(
-            project_id=request.project_id,
-            mr_id=request.mr_id,
-            review_result=request.review_result,
-            format_type=request.format_type
-        )
-        
-        return {
-            "status": "success",
-            "comment_info": comment_info,
-            "message": "Review comment posted successfully"
-        }
-        
-    except Exception as e:
-        logger.error(f"Failed to post comment: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to post comment: {str(e)}"
-        )
 
 @app.post("/review/update-mr")
 async def update_mr_with_review(
@@ -340,64 +300,6 @@ async def get_review_status(review_id: str):
         "review_id": review_id
     }
 
-@app.post("/batch-review")
-async def batch_review(
-    requests: List[ReviewRequest],
-    background_tasks: BackgroundTasks
-):
-    """
-    批量审查多个MR
-    
-    适合CI/CD系统中批量处理多个MR。
-    """
-    if len(requests) > 10:  # 限制批量大小
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Batch size cannot exceed 10"
-        )
-    
-    try:
-        # 启动后台任务处理批量审查
-        batch_id = f"batch_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-        
-        async def process_batch():
-            results = []
-            for req in requests:
-                try:
-                    reviewer = GitLabReviewer(
-                        gitlab_url=req.gitlab_url,
-                        access_token=req.access_token,
-                        ai_model=req.ai_model
-                    )
-                    
-                    result = await reviewer.review_merge_request(
-                        project_id=req.project_id,
-                        mr_id=req.mr_id,
-                        review_type=req.review_type,
-                        options=req.options
-                    )
-                    results.append({"status": "success", "result": result})
-                    
-                except Exception as e:
-                    results.append({"status": "error", "error": str(e)})
-            
-            # 这里可以将结果存储到数据库或发送通知
-            logger.info(f"Batch {batch_id} completed with {len(results)} results")
-        
-        background_tasks.add_task(process_batch)
-        
-        return {
-            "batch_id": batch_id,
-            "status": "processing",
-            "message": f"Batch review started for {len(requests)} MRs"
-        }
-        
-    except Exception as e:
-        logger.error(f"Batch review failed: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Batch review failed: {str(e)}"
-        )
 
 # 错误处理
 @app.exception_handler(HTTPException)

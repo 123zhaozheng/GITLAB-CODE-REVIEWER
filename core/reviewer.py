@@ -207,24 +207,6 @@ class GitLabReviewer:
             "score": review.score
         }
     
-    async def post_review_comment(self, project_id: str, mr_id: int,
-                                review_result: Dict[str, Any],
-                                format_type: str = "markdown") -> Dict[str, Any]:
-        """将审查结果发布为MR评论"""
-        try:
-            comment_body = self._format_review_comment(review_result, format_type)
-            
-            async with self.gitlab_client:
-                comment_info = await self.gitlab_client.create_mr_note(
-                    project_id, mr_id, comment_body
-                )
-            
-            logger.info(f"Posted review comment to MR {project_id}!{mr_id}")
-            return comment_info
-            
-        except Exception as e:
-            logger.error(f"Failed to post review comment: {e}")
-            raise
     
     async def update_mr_with_review(self, project_id: str, mr_id: int,
                                   review_result: Dict[str, Any]) -> bool:
@@ -299,88 +281,8 @@ class GitLabReviewer:
             "metadata": {"review_timestamp": datetime.now().isoformat()}
         }
     
-    def _format_review_comment(self, review_result: Dict[str, Any], 
-                             format_type: str = "markdown") -> str:
-        """格式化审查评论"""
-        
-        if format_type == "markdown":
-            return self._format_markdown_comment(review_result)
-        else:
-            return self._format_plain_comment(review_result)
     
-    def _format_markdown_comment(self, result: Dict[str, Any]) -> str:
-        """格式化为Markdown评论"""
-        score = result.get("score", 0)
-        review_type = result.get("review_type", "unknown")
-        
-        # 评分表情符号
-        score_emoji = "🟢" if score >= 8 else "🟡" if score >= 6 else "🔴"
-        
-        comment = f"""## 🤖 AI代码审查报告 {score_emoji}
-
-**审查类型**: {REVIEW_TYPES.get(review_type, {}).get('name', review_type)}
-**评分**: {score:.1f}/10.0
-**文件数量**: {result.get('statistics', {}).get('files_analyzed', 0)}
-
-### 📋 审查摘要
-{result.get('summary', '无摘要')}
-
-"""
-        
-        # 添加发现的问题
-        findings = result.get('findings', [])
-        if findings:
-            comment += "### 🔍 发现的问题\n"
-            for i, finding in enumerate(findings[:5], 1):  # 限制显示前5个
-                if isinstance(finding, dict):
-                    comment += f"{i}. **{finding.get('filename', 'Unknown')}**: {finding.get('description', finding.get('message', 'No description'))}\n"
-                else:
-                    comment += f"{i}. {str(finding)}\n"
-            
-            if len(findings) > 5:
-                comment += f"\n... 还有 {len(findings) - 5} 个问题\n"
-            comment += "\n"
-        
-        # 添加建议
-        suggestions = result.get('suggestions', [])
-        recommendations = result.get('recommendations', [])
-        all_suggestions = suggestions + recommendations
-        
-        if all_suggestions:
-            comment += "### 💡 改进建议\n"
-            for i, suggestion in enumerate(all_suggestions[:3], 1):  # 限制显示前3个
-                comment += f"{i}. {suggestion}\n"
-            comment += "\n"
-        
-        # 添加元数据
-        metadata = result.get('metadata', {})
-        comment += f"""### 📊 审查信息
-- **AI模型**: {metadata.get('ai_model', 'unknown')}
-- **审查时间**: {metadata.get('review_timestamp', 'unknown')}
-- **审查ID**: `{result.get('review_id', 'unknown')}`
-
----
-*由 [GitLab Code Reviewer]({self.gitlab_url}) v{settings.service_version} 生成*
-"""
-        
-        return comment
     
-    def _format_plain_comment(self, result: Dict[str, Any]) -> str:
-        """格式化为纯文本评论"""
-        score = result.get("score", 0)
-        comment = f"AI代码审查完成\n评分: {score:.1f}/10.0\n\n"
-        comment += f"摘要: {result.get('summary', '无摘要')}\n\n"
-        
-        findings = result.get('findings', [])
-        if findings:
-            comment += "发现的问题:\n"
-            for i, finding in enumerate(findings[:3], 1):
-                if isinstance(finding, dict):
-                    comment += f"{i}. {finding.get('description', str(finding))}\n"
-                else:
-                    comment += f"{i}. {str(finding)}\n"
-        
-        return comment
     
     def _generate_review_summary(self, review_result: Dict[str, Any]) -> str:
         """生成审查总结"""

@@ -282,22 +282,6 @@ class GitLabClient:
         # 限制文件数量
         return relevant_changes[:settings.max_files_per_review]
     
-    async def create_mr_note(self, project_id: str, mr_id: int, body: str) -> Dict:
-        """在MR上创建评论"""
-        try:
-            project = self.gitlab.projects.get(project_id)
-            mr = project.mergerequests.get(mr_id)
-            note = mr.notes.create({'body': body})
-            return {
-                "id": note.id,
-                "body": note.body,
-                "created_at": note.created_at,
-                "web_url": f"{mr.web_url}#note_{note.id}"
-            }
-        except Exception as e:
-            logger.error(f"Failed to create MR note: {e}")
-            raise
-    
     async def update_mr_description(self, project_id: str, mr_id: int, 
                                    title: Optional[str] = None, 
                                    description: Optional[str] = None) -> bool:
