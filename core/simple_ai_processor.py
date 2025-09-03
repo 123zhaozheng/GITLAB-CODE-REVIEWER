@@ -615,12 +615,18 @@ class SimpleAIProcessor:
 
 {full_content}
 
+分析要求：
+1. **避免重复发现**：对于同一个根本问题（如同一行的拼写错误），请将所有相关描述合并到一个发现中，不要分别报告为多个独立问题
+2. **合并相关问题**：如果多个问题源于同一根本原因或位于同一代码行，请整合为一个完整的描述
+3. **聚焦关键问题**：优先报告对代码功能和质量有重大影响的问题
+4. **结合上下文**：结合整个文件内容来评估，但重点关注diff部分的变更
+
 请提供：
-1. 发现的具体问题，包括行号和详细说明
-2. 针对性的改进建议
-3. 评估变更的影响和风险
-4. 结合整个文件的内容，重点关注diff部分的代码
-注意：这是单独文件分析，请专注于该文件本身的问题，而不是整体架构。
+1. 去重后的关键问题，每个问题包含完整的描述和解决方案
+2. 实用的改进建议
+3. 变更影响评估
+
+注意：这是单文件分析，避免重复报告相同或相似的问题。
 """
         
         # 如果不支持结构化输出，添加JSON格式说明
@@ -633,12 +639,14 @@ class SimpleAIProcessor:
             "type": "问题类型",
             "line_number": 行号,
             "severity": "high/medium/low",
-            "description": "问题描述",
-            "suggestion": "修复建议"
+            "description": "完整的问题描述（如果同一行有多个相关问题，请合并描述）",
+            "suggestion": "综合的修复建议"
         }
     ],
     "suggestions": ["改进建议1", "改进建议2"]
 }
+
+重要提醒：请确保同一行或相关的问题只生成一个finding对象，将所有相关信息整合到description中。
 """
         else:
             prompt = base_prompt
@@ -820,10 +828,12 @@ MR信息：
             # 对每个潜在问题进行AI深度分析
             for issue in issues:
                 try:
+                    # 从描述中提取代码行（如果需要）
+                    code_line = issue.get("description", "").split("代码：")[-1] if "代码：" in issue.get("description", "") else ""
                     ai_result = await self._ai_security_analysis(
                         file_patch.filename, 
                         issue["line_number"], 
-                        issue["code_line"],
+                        code_line,
                         issue["category"]
                     )
                     if ai_result["is_vulnerability"]:
@@ -916,7 +926,8 @@ MR信息：
                     "type": "line_too_long",
                     "filename": file_patch.filename,
                     "line_number": line_num,
-                    "message": "代码行过长",
+                    "description": f"代码行过长（{len(line_content)}字符），建议保持在120字符以内以提高可读性",
+                    "suggestion": "将长行代码拆分为多行，或者重构复杂的表达式",
                     "severity": "low"
                 }
                 issues.append(issue)
@@ -929,7 +940,8 @@ MR信息：
                     "type": "debug_statement",
                     "filename": file_patch.filename,
                     "line_number": line_num,
-                    "message": "可能包含调试语句",
+                    "description": f"检测到疑似调试语句：{line_content[:50]}{'...' if len(line_content) > 50 else ''}。调试语句不应提交到生产代码中",
+                    "suggestion": "移除调试语句，或使用日志系统替代",
                     "severity": "medium"
                 }
                 issues.append(issue)
@@ -942,7 +954,8 @@ MR信息：
                     "type": "todo_comment",
                     "filename": file_patch.filename,
                     "line_number": line_num,
-                    "message": "包含待办事项或修复标记",
+                    "description": f"包含待办事项或修复标记：{line_content[:50]}{'...' if len(line_content) > 50 else ''}。建议在发布前处理所有TODO和FIXME",
+                    "suggestion": "完成TODO项目或创建对应的工单来跟踪，避免在生产代码中留下未完成的标记",
                     "severity": "low"
                 }
                 issues.append(issue)
@@ -967,23 +980,44 @@ MR信息：
         new_lines = [line for line in file_patch.patch.split('\n') if line.startswith('+')]
         
         security_patterns = {
-            "sql_injection": [r"execute\(.*\+.*\)", r"query\(.*\+.*\)", r"SELECT.*\+"],
-            "xss": [r"innerHTML\s*=", r"document\.write\(", r"eval\("],
-            "hardcoded_secrets": [r"password\s*=\s*['\"]", r"api[_-]?key\s*=\s*['\"]", r"secret\s*=\s*['\"]"],
-            "path_traversal": [r"\.\.\/", r"\.\.\\\\", r"os\.path\.join.*\.\."],
-            "command_injection": [r"os\.system\(", r"subprocess\.", r"exec\(", r"shell=True"]
+            "sql_injection": {
+                "patterns": [r"execute\(.*\+.*\)", r"query\(.*\+.*\)", r"SELECT.*\+"],
+                "description": "可能存在SQL注入风险，检测到字符串拼接构建SQL查询",
+                "suggestion": "使用参数化查询或预编译语句防止SQL注入"
+            },
+            "xss": {
+                "patterns": [r"innerHTML\s*=", r"document\.write\(", r"eval\("],
+                "description": "可能存在跨站脚本(XSS)风险，检测到直接操作DOM或执行动态代码",
+                "suggestion": "对用户输入进行转义，使用安全的DOM操作方法"
+            },
+            "hardcoded_secrets": {
+                "patterns": [r"password\s*=\s*['\"]", r"api[_-]?key\s*=\s*['\"]", r"secret\s*=\s*['\"]"],
+                "description": "检测到硬编码的敏感信息，存在安全泄露风险",
+                "suggestion": "将敏感信息存储在环境变量或安全的配置管理系统中"
+            },
+            "path_traversal": {
+                "patterns": [r"\.\.\/", r"\.\.\\\\", r"os\.path\.join.*\.\."],
+                "description": "可能存在路径穿越风险，检测到相对路径操作",
+                "suggestion": "验证和清理文件路径，使用绝对路径或安全的路径处理方法"
+            },
+            "command_injection": {
+                "patterns": [r"os\.system\(", r"subprocess\.", r"exec\(", r"shell=True"],
+                "description": "可能存在命令注入风险，检测到系统命令执行",
+                "suggestion": "避免执行用户输入的命令，使用参数化的命令执行或白名单验证"
+            }
         }
         
         for line_num, line in enumerate(new_lines, 1):
-            for category, patterns in security_patterns.items():
-                if any(re.search(pattern, line, re.IGNORECASE) for pattern in patterns):
+            for category, config in security_patterns.items():
+                if any(re.search(pattern, line, re.IGNORECASE) for pattern in config["patterns"]):
                     issues.append({
                         "type": "potential_security_issue",
-                        "category": category,
                         "filename": file_patch.filename,
                         "line_number": line_num,
-                        "code_line": line.strip(),
-                        "severity": "high"
+                        "description": f"{config['description']}。代码：{line.strip()[:50]}{'...' if len(line.strip()) > 50 else ''}",
+                        "suggestion": config["suggestion"],
+                        "severity": "high",
+                        "category": category
                     })
         
         return issues
@@ -994,21 +1028,36 @@ MR信息：
         new_lines = [line for line in file_patch.patch.split('\n') if line.startswith('+')]
         
         performance_patterns = {
-            "n_plus_1_query": [r"for.*in.*:", r"\.get\(", r"\.filter\("],
-            "inefficient_loop": [r"for.*in.*for.*in", r"while.*while"],
-            "memory_leak": [r"\.append\(", r"global\s+", r"cache\["],
-            "blocking_io": [r"requests\.get", r"urllib\.request", r"time\.sleep"],
-            "inefficient_data_structure": [r"list\(\)", r"dict\(\)", r"\[\].*in.*for"]
+            "n_plus_1_query": {
+                "patterns": [r"for.*in.*:", r"\.get\(", r"\.filter\("],
+                "description": "可能存在N+1查询问题，在循环中进行数据库查询"
+            },
+            "inefficient_loop": {
+                "patterns": [r"for.*in.*for.*in", r"while.*while"],
+                "description": "检测到嵌套循环，可能存在性能问题"
+            },
+            "memory_leak": {
+                "patterns": [r"\.append\(", r"global\s+", r"cache\["],
+                "description": "可能存在内存泄漏风险，检测到持续增长的数据结构"
+            },
+            "blocking_io": {
+                "patterns": [r"requests\.get", r"urllib\.request", r"time\.sleep"],
+                "description": "检测到阻塞I/O操作，可能影响性能"
+            },
+            "inefficient_data_structure": {
+                "patterns": [r"list\(\)", r"dict\(\)", r"\[\].*in.*for"],
+                "description": "可能使用了低效的数据结构或操作"
+            }
         }
         
         for line_num, line in enumerate(new_lines, 1):
-            for issue_type, patterns in performance_patterns.items():
-                if any(re.search(pattern, line, re.IGNORECASE) for pattern in patterns):
+            for issue_type, config in performance_patterns.items():
+                if any(re.search(pattern, line, re.IGNORECASE) for pattern in config["patterns"]):
                     issues.append({
                         "type": issue_type,
                         "filename": file_patch.filename,
                         "line_number": line_num,
-                        "code_line": line.strip(),
+                        "description": f"{config['description']}。代码：{line.strip()[:50]}{'...' if len(line.strip()) > 50 else ''}",
                         "severity": "medium",
                         "suggestion": self._get_performance_suggestion(issue_type)
                     })
@@ -1195,7 +1244,6 @@ MR信息：
             result.update({
                 "filename": filename,
                 "line_number": line_num,
-                "code_line": code_line,
                 "category": category
             })
             return result
