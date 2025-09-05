@@ -7,7 +7,7 @@ import json
 import re
 import time
 from typing import Dict, List, Optional, Any
-import tiktoken
+# import tiktoken  # 已移除，使用简单估算替代
 import openai
 import logging
 
@@ -87,30 +87,88 @@ PERFORMANCE_ANALYSIS_SCHEMA = {
 }
 
 class TokenManager:
-    """Token管理器"""
+    """Token管理器 - 使用简单估算，不依赖tiktoken"""
+    
+    # 不同模型的字符-token比例 (字符数/token数)
+    CHAR_TOKEN_RATIOS = {
+        'gpt-4': 3.8,
+        'gpt-4-turbo': 3.8, 
+        'gpt-3.5-turbo': 3.8,
+        'claude': 4.0,
+        'llama': 3.5,      # Llama 系列
+        'qwen': 4.2,       # 通义千问 (中文友好)
+        'chatglm': 4.2,    # ChatGLM (中文友好)
+        'deepseek': 3.8,   # DeepSeek
+        'default': 4.0     # 默认比例
+    }
     
     def __init__(self, model: str = None):
         self.model = model or settings.default_ai_model
-        try:
-            if "gpt" in self.model:
-                self.encoder = tiktoken.encoding_for_model(self.model)
-            else:
-                self.encoder = tiktoken.get_encoding("o200k_base")
-        except:
-            # 备用方案：使用 cl100k_base 编码
-            try:
-                self.encoder = tiktoken.get_encoding("cl100k_base")
-            except:
-                # 最后备用方案：使用 GPT-3.5 的编码
-                self.encoder = tiktoken.encoding_for_model("gpt-3.5-turbo")
+        self.ratio = self._get_ratio_for_model(self.model)
+        logger.info(f"TokenManager initialized for model '{self.model}' with ratio {self.ratio}")
+    
+    def _get_ratio_for_model(self, model: str) -> float:
+        """根据模型名获取字符-token比例"""
+        model_lower = model.lower()
+        
+        # 检查模型名中是否包含已知模型类型
+        for model_type, ratio in self.CHAR_TOKEN_RATIOS.items():
+            if model_type in model_lower:
+                return ratio
+        
+        # 如果是中文相关的模型，使用更高的比例
+        chinese_indicators = ['chinese', 'zh', 'cn', 'baichuan', 'internlm']
+        if any(indicator in model_lower for indicator in chinese_indicators):
+            return 4.5
+            
+        return self.CHAR_TOKEN_RATIOS['default']
     
     def count_tokens(self, text: str) -> int:
-        """计算文本token数量"""
-        try:
-            return len(self.encoder.encode(text))
-        except:
-            # 备用方案：按字符数估算
-            return len(text) // 4
+        """计算文本token数量 - 基于字符数的简单估算"""
+        if not text:
+            return 0
+        
+        char_count = len(text)
+        
+        # 检测文本类型并调整比例
+        adjusted_ratio = self._adjust_ratio_for_content(text, self.ratio)
+        
+        # 计算token数量
+        estimated_tokens = max(1, int(char_count / adjusted_ratio))
+        
+        return estimated_tokens
+    
+    def _adjust_ratio_for_content(self, text: str, base_ratio: float) -> float:
+        """根据文本内容调整字符-token比例"""
+        # 检测是否是代码文本
+        code_patterns = [
+            r'def\s+\w+\s*\(',      # Python函数定义
+            r'class\s+\w+',         # 类定义
+            r'function\s*\(',       # JavaScript函数
+            r'import\s+\w+',        # 导入语句
+            r'from\s+\w+\s+import', # Python导入
+            r'{\s*$',               # 代码块开始
+            r'}\s*$',               # 代码块结束
+            r'if\s*\(',             # 条件语句
+            r'for\s*\(',            # 循环语句
+            r'while\s*\(',          # while循环
+        ]
+        
+        is_code = any(re.search(pattern, text, re.MULTILINE) for pattern in code_patterns)
+        
+        if is_code:
+            # 代码文本通常token密度更高（更多符号和关键字）
+            return base_ratio * 0.75
+        
+        # 检测是否包含大量中文
+        chinese_char_count = len(re.findall(r'[\u4e00-\u9fff]', text))
+        chinese_ratio = chinese_char_count / len(text) if text else 0
+        
+        if chinese_ratio > 0.3:  # 超过30%中文字符
+            # 中文字符通常需要更多token
+            return base_ratio * 1.2
+        
+        return base_ratio
     
     def estimate_cost(self, input_tokens: int, output_tokens: int = 1000) -> float:
         """估算API调用成本"""
@@ -295,9 +353,11 @@ class SimpleOpenAIClient:
             return True
         
         # OpenAI GPT-4 和 GPT-3.5-turbo 的较新版本支持结构化输出
+        # DeepSeek 和其他现代模型也支持结构化输出
         supported_models = [
             "gpt-4o", "gpt-4o-mini", "gpt-4-turbo", 
-            "gpt-4", "gpt-3.5-turbo"
+            "gpt-4", "gpt-3.5-turbo",
+            "deepseek", "claude", "gemini"  # 添加更多模型支持
         ]
         
         # 检查是否为支持的模型
@@ -619,20 +679,23 @@ class SimpleAIProcessor:
 1. **避免重复发现**：对于同一个根本问题（如同一行的拼写错误），请将所有相关描述合并到一个发现中，不要分别报告为多个独立问题
 2. **合并相关问题**：如果多个问题源于同一根本原因或位于同一代码行，请整合为一个完整的描述
 3. **聚焦关键问题**：优先报告对代码功能和质量有重大影响的问题
-4. **结合上下文**：结合整个文件内容来评估，但重点关注diff部分的变更
+4. **结合上下文**：结合整个可能被截断的文件内容来评估，但重点关注diff部分的变更
+5. **避免误解**：我希望你审查的是diff部分，对于你觉得整个文件内容被截断请不需要给出其问题发现和建议，这个是因为避免上下文超限主动截断
 
 请提供：
-1. 去重后的关键问题，每个问题包含完整的描述和解决方案
+1. 去重后的关键问题0-3个，每个问题包含完整的描述和解决方案
 2. 实用的改进建议
 3. 变更影响评估
 
-注意：这是单文件分析，避免重复报告相同或相似的问题。
+注意：这是单文件分析，避免重复报告相同或相似的问题。⚠️ 切记不允许你擅自关注整个文件内容，只关注diff部分，整个文件内容是指作为你审查diff的辅助信息
 """
         
         # 如果不支持结构化输出，添加JSON格式说明
         if not self.client._supports_structured_output(self.model):
             prompt = base_prompt + """
-请严格按照以下JSON格式回复：
+
+⚠️ 重要：请严格按照以下JSON格式回复，不要添加任何其他文本、解释或markdown标记：
+
 {
     "findings": [
         {
@@ -646,7 +709,12 @@ class SimpleAIProcessor:
     "suggestions": ["改进建议1", "改进建议2"]
 }
 
-重要提醒：请确保同一行或相关的问题只生成一个finding对象，将所有相关信息整合到description中。
+格式要求：
+1. 输出必须是有效的JSON格式
+2. 不要用```json或其他代码块包装
+3. 不要添加任何解释文字
+4. 确保所有字符串都用双引号包围
+5. 确保同一行或相关的问题只生成一个finding对象
 """
         else:
             prompt = base_prompt
@@ -688,7 +756,29 @@ class SimpleAIProcessor:
             
             # 解析响应
             cleaned_response = self._extract_json_from_response(response)
-            result = json.loads(cleaned_response)
+            
+            try:
+                result = json.loads(cleaned_response)
+                logger.debug("Successfully parsed JSON response")
+            except json.JSONDecodeError as e:
+                logger.error(f"JSON解析失败: {e}")
+                logger.error(f"尝试解析的JSON: {cleaned_response[:500]}...")
+                
+                # 尝试使用更激进的修复方法
+                try:
+                    fixed_json = self._aggressive_json_fix(cleaned_response)
+                    result = json.loads(fixed_json)
+                    logger.info("使用激进修复方法成功解析JSON")
+                except Exception as e2:
+                    logger.error(f"激进修复也失败: {e2}")
+                    # 返回默认结构
+                    return {
+                        "findings": [],
+                        "suggestions": [f"AI分析失败，JSON解析错误: {str(e)[:100]}"]
+                    }
+            
+            # 验证并修复结果结构
+            result = self._validate_and_fix_result(result)
             
             # 为每个finding添加filename
             for finding in result.get("findings", []):
@@ -1145,9 +1235,12 @@ MR信息：
             return {"findings": [], "suggestions": [], "overall_assessment": "AI分析处理失败"}
     
     def _extract_json_from_response(self, response: str) -> str:
-        """从响应中提取JSON内容"""
+        """从响应中提取JSON内容，增强容错性"""
+        import re
+        
         # 移除可能的markdown代码块标记
         response = response.strip()
+        logger.debug(f"Processing response: {response[:200]}...")
         
         # 如果响应包含```json标记，提取其中的JSON
         if "```json" in response:
@@ -1155,16 +1248,16 @@ MR信息：
             end = response.find("```", start)
             if end != -1:
                 json_content = response[start:end].strip()
-                logger.debug("Extracted JSON from markdown block")
-                return json_content
+                logger.debug("Extracted JSON from ```json markdown block")
+                return self._fix_common_json_issues(json_content)
         
         # 如果响应包含```标记但没有json标识，也尝试提取
         if response.startswith("```") and response.endswith("```"):
             lines = response.split('\n')
             if len(lines) > 2:
                 json_content = '\n'.join(lines[1:-1]).strip()
-                logger.debug("Extracted content from code block")
-                return json_content
+                logger.debug("Extracted content from generic code block")
+                return self._fix_common_json_issues(json_content)
         
         # 尝试找到JSON对象的开始和结束
         start_idx = response.find('{')
@@ -1179,11 +1272,115 @@ MR信息：
                     if brace_count == 0:
                         json_content = response[start_idx:i+1]
                         logger.debug("Extracted JSON object from response")
-                        return json_content
+                        return self._fix_common_json_issues(json_content)
         
-        # 如果没有找到JSON结构，返回原始响应
-        logger.debug("No JSON structure found, returning original response")
-        return response
+        # 如果没有找到JSON结构，尝试修复并返回
+        logger.debug("No clear JSON structure found, attempting to fix response")
+        return self._fix_common_json_issues(response)
+    
+    def _fix_common_json_issues(self, json_str: str) -> str:
+        """修复常见的JSON格式问题"""
+        import re
+        
+        # 移除前后空白
+        json_str = json_str.strip()
+        
+        # 如果不是以{开头，尝试找到并截取JSON部分
+        if not json_str.startswith('{'):
+            match = re.search(r'\{.*\}', json_str, re.DOTALL)
+            if match:
+                json_str = match.group(0)
+        
+        # 修复常见的JSON格式错误
+        # 1. 修复单引号为双引号
+        json_str = re.sub(r"'([^']*)':", r'"\1":', json_str)  # 'key': -> "key":
+        json_str = re.sub(r":\s*'([^']*)'", r': "\1"', json_str)  # : 'value' -> : "value"
+        
+        # 2. 修复未引用的键名
+        json_str = re.sub(r'(\w+):', r'"\1":', json_str)
+        
+        # 3. 修复尾随逗号
+        json_str = re.sub(r',\s*}', '}', json_str)
+        json_str = re.sub(r',\s*]', ']', json_str)
+        
+        # 4. 确保字符串值被正确引用
+        # 这个比较复杂，先跳过高级修复
+        
+        logger.debug(f"Fixed JSON: {json_str[:200]}...")
+        return json_str
+    
+    def _aggressive_json_fix(self, json_str: str) -> str:
+        """激进的JSON修复方法"""
+        import re
+        
+        logger.debug("尝试激进JSON修复...")
+        
+        # 如果完全解析失败，尝试构建一个最小的有效JSON
+        if not json_str or json_str.strip() == "":
+            return '{"findings": [], "suggestions": []}'
+        
+        # 尝试提取findings和suggestions的内容
+        findings_match = re.search(r'"findings"\s*:\s*\[(.*?)\]', json_str, re.DOTALL)
+        suggestions_match = re.search(r'"suggestions"\s*:\s*\[(.*?)\]', json_str, re.DOTALL)
+        
+        findings_content = findings_match.group(1) if findings_match else ""
+        suggestions_content = suggestions_match.group(1) if suggestions_match else ""
+        
+        # 构建一个新的JSON
+        fixed_json = f'{{"findings": [{findings_content}], "suggestions": [{suggestions_content}]}}'
+        
+        # 再次应用基础修复
+        return self._fix_common_json_issues(fixed_json)
+    
+    def _validate_and_fix_result(self, result: dict) -> dict:
+        """验证并修复结果结构"""
+        # 确保必需的字段存在
+        if not isinstance(result, dict):
+            logger.warning("结果不是字典类型，返回默认结构")
+            return {"findings": [], "suggestions": []}
+        
+        # 确保findings是列表
+        if "findings" not in result or not isinstance(result["findings"], list):
+            logger.warning("findings字段缺失或格式错误，使用空列表")
+            result["findings"] = []
+        
+        # 确保suggestions是列表
+        if "suggestions" not in result or not isinstance(result["suggestions"], list):
+            logger.warning("suggestions字段缺失或格式错误，使用空列表")
+            result["suggestions"] = []
+        
+        # 验证每个finding的格式
+        valid_findings = []
+        for i, finding in enumerate(result["findings"]):
+            if not isinstance(finding, dict):
+                logger.warning(f"Finding {i} 不是字典类型，跳过")
+                continue
+            
+            # 确保必需字段存在
+            if "type" not in finding:
+                finding["type"] = "unknown"
+            if "severity" not in finding:
+                finding["severity"] = "low"
+            if "description" not in finding:
+                finding["description"] = "未提供描述"
+            
+            # 确保severity值有效
+            if finding["severity"] not in ["high", "medium", "low"]:
+                finding["severity"] = "low"
+            
+            valid_findings.append(finding)
+        
+        result["findings"] = valid_findings
+        
+        # 验证suggestions
+        valid_suggestions = []
+        for suggestion in result["suggestions"]:
+            if isinstance(suggestion, str) and suggestion.strip():
+                valid_suggestions.append(suggestion.strip())
+        result["suggestions"] = valid_suggestions
+        
+        logger.debug(f"验证后的结果: {len(result['findings'])} findings, {len(result['suggestions'])} suggestions")
+        return result
     
     async def _ai_security_analysis(self, filename: str, line_num: int, code_line: str, category: str) -> Dict[str, Any]:
         """AI安全分析"""

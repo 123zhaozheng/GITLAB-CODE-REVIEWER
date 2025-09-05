@@ -63,7 +63,7 @@ class Settings(BaseSettings):
     
     # 结构化输出配置
     enable_structured_output: bool = Field(default=True, env="ENABLE_STRUCTURED_OUTPUT")
-    force_structured_output: bool = Field(default=False, env="FORCE_STRUCTURED_OUTPUT")
+    force_structured_output: bool = Field(default=True, env="FORCE_STRUCTURED_OUTPUT")
 
     def __init__(self, **kwargs):
         """初始化设置，手动处理allowed_hosts环境变量"""
