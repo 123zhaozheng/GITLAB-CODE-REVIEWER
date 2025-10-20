@@ -8,6 +8,8 @@ from typing import Dict, List, Optional, Tuple, Any
 import gitlab
 from urllib.parse import urlparse
 import logging
+import fnmatch
+
 
 from config.settings import settings
 
@@ -261,26 +263,49 @@ class GitLabClient:
             return "MODIFIED"
     
     def _filter_relevant_files(self, changes: List[Dict]) -> List[Dict]:
-        """智能过滤相关文件"""
+        """
+        智能过滤相关文件：
+        1) 基于路径/模式忽略无需审查的目录或文件（如 node_modules、venv、target 等）
+        2) 基于扩展名优先级（FILE_PRIORITY）排序与过滤（优先级为0视为忽略）
+        3) 限制最大文件数量
+
+        当 settings.smart_filtering = False 时，仅返回前 N 个（按出现顺序），不做排序
+        """
+        # 路径/模式过滤（始终应用，防止明显无意义的产物进入审查）
+        ignored_patterns = settings.ignore_path_patterns or []
+
+        def is_ignored_by_path(change: Dict) -> bool:
+            file_path = change.get('new_path') or change.get('old_path') or ''
+            # GitLab 路径为 posix 风格，确保统一
+            norm = file_path.replace('\\', '/').lstrip('/')
+            for pattern in ignored_patterns:
+                if fnmatch.fnmatch(norm, pattern):
+                    return True
+            return False
+
+        path_filtered = [c for c in changes if not is_ignored_by_path(c)]
+
         if not settings.smart_filtering:
-            return changes[:settings.max_files_per_review]
-        
-        # 按文件重要性排序
+            # 关闭智能筛选时，仅做数量限制
+            return path_filtered[:settings.max_files_per_review]
+
+        # 基于扩展名的优先级排序
         from config.settings import FILE_PRIORITY
-        
-        def get_file_priority(change):
+
+        def get_file_priority(change: Dict) -> int:
             file_path = change.get('new_path', '')
             ext = '.' + file_path.split('.')[-1] if '.' in file_path else ''
             return FILE_PRIORITY.get(ext, 5)  # 默认中等优先级
-        
-        # 过滤掉优先级为0的文件（忽略文件）
-        relevant_changes = [c for c in changes if get_file_priority(c) > 0]
-        
-        # 按优先级排序
+
+        # 过滤掉优先级为0的文件（忽略文件类型）
+        relevant_changes = [c for c in path_filtered if get_file_priority(c) > 0]
+
+        # 按优先级排序（高 → 低）
         relevant_changes.sort(key=get_file_priority, reverse=True)
-        
+
         # 限制文件数量
         return relevant_changes[:settings.max_files_per_review]
+    
     
     async def update_mr_description(self, project_id: str, mr_id: int, 
                                    title: Optional[str] = None, 

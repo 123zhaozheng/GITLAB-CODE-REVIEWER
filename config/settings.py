@@ -58,6 +58,32 @@ class Settings(BaseSettings):
     max_cost_per_review: float = Field(default=0.50, env="MAX_COST_PER_REVIEW")
     smart_filtering: bool = Field(default=True, env="SMART_FILTERING")
     
+    # 路径/文件忽略模式（支持通配符，基于fnmatch），用于排除无需审查的目录/文件
+    # 可通过环境变量覆盖：IGNORE_PATH_PATTERNS（JSON数组或逗号分隔）
+    ignore_path_patterns: List[str] = Field(default_factory=lambda: [
+        # 版本/包管理与构建产物（支持任意层级）
+        "node_modules/*", "*/node_modules/*",
+        "dist/*", "*/dist/*",
+        "build/*", "*/build/*",
+        "target/*", "*/target/*",
+        "out/*", "*/out/*",
+        # 虚拟环境与缓存
+        "venv/*", "*/venv/*",
+        ".venv/*", "*/.venv/*",
+        "__pycache__/*", "*/__pycache__/*",
+        "site-packages/*", "*/site-packages/*",
+        # VCS/IDE
+        ".git/*", "*/.git/*",
+        ".idea/*", "*/.idea/*",
+        ".vscode/*", "*/.vscode/*",
+        # 生成/覆盖率
+        "coverage/*", "*/coverage/*", "coverage.*",
+        # 压缩/二进制/日志临时等
+        "*.min.js", "*.min.css", "*.lock", "*.log", "*.tmp", "*.cache",
+        # 其他常见供应商目录
+        "vendor/*", "*/vendor/*"
+    ])
+    
     # LiteLLM兼容配置 (用于向后兼容)
     litellm_model_config: Optional[Dict[str, Any]] = None
     
