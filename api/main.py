@@ -14,6 +14,7 @@ import os
 
 from core.reviewer import GitLabReviewer
 from config.settings import settings, REVIEW_TYPES
+from api.esb_middleware import EsbMiddleware
 
 # 配置日志
 logging.basicConfig(
@@ -38,6 +39,16 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+)
+
+# 添加 ESB 中间件
+# 配置说明：
+# - ["/esb/"] - 仅对 /esb/ 开头的路径启用 ESB 包裹
+# - ["/"] - 对所有路径启用 ESB 包裹（包括 /review, /health 等）
+# - ["/review", "/esb/"] - 对指定的多个路径启用
+app.add_middleware(
+    EsbMiddleware,
+    esb_enabled_paths=["/review"]  # 修改为 ["/"] 可让所有接口都支持 ESB
 )
 
 # Pydantic模型定义
@@ -259,18 +270,18 @@ async def update_mr_with_review(
 ):
     """
     用审查结果更新MR描述
-    
+
     将审查总结添加到MR描述中。
     """
     try:
         reviewer = GitLabReviewer(gitlab_url, access_token)
-        
+
         success = await reviewer.update_mr_with_review(
             project_id=project_id,
             mr_id=mr_id,
             review_result=review_result
         )
-        
+
         if success:
             return {"status": "success", "message": "MR updated successfully"}
         else:
@@ -278,13 +289,80 @@ async def update_mr_with_review(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail="Failed to update MR"
             )
-            
+
     except Exception as e:
         logger.error(f"Failed to update MR: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to update MR: {str(e)}"
         )
+
+
+# ESB 专用路由
+@app.post("/esb/review")
+async def esb_review_merge_request(
+    request: ReviewRequest,
+    background_tasks: BackgroundTasks,
+    reviewer: GitLabReviewer = Depends(get_reviewer)
+):
+    """
+    ESB 格式的代码审查接口
+
+    此接口会自动处理 ESB 请求和响应的包裹：
+    - 请求格式: { "ReqInfo": {...}, "Request": {...} }
+    - 响应格式: { "RspInfo": {...}, "Response": {...} }
+
+    注意：ESB 中间件会自动解包请求和包裹响应，
+    业务逻辑只需处理 Request 和 Response 部分。
+    """
+    try:
+        logger.info(f"[ESB] Starting review for project {request.project_id}")
+
+        if request.mode == "mr":
+            if not request.mr_id:
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="mr_id is required for 'mr' mode")
+
+            logger.info(f"[ESB] Mode: MR review for !{request.mr_id}")
+            result = await reviewer.review_merge_request(
+                project_id=request.project_id,
+                mr_id=request.mr_id,
+                review_type=request.review_type,
+                options=request.options
+            )
+
+        elif request.mode == "branch_compare":
+            if not request.target_branch or not request.source_branch:
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="target_branch and source_branch are required for 'branch_compare' mode")
+
+            logger.info(f"[ESB] Mode: Branch comparison between '{request.source_branch}' and '{request.target_branch}'")
+            result = await reviewer.review_branch_comparison(
+                project_id=request.project_id,
+                target_branch=request.target_branch,
+                source_branch=request.source_branch,
+                review_type=request.review_type
+            )
+
+        else:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Invalid mode: '{request.mode}'. Must be 'mr' or 'branch_compare'.")
+
+        logger.info(f"[ESB] Review completed with score {result['score']}")
+
+        # 注意：返回的数据会被 ESB 中间件自动包裹到 Response 字段中
+        return ReviewResponse(**result)
+
+    except ValueError as e:
+        logger.error(f"[ESB] Validation error: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e)
+        )
+    except Exception as e:
+        logger.error(f"[ESB] Review failed: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Review failed: {str(e)}"
+        )
+
 
 @app.get("/review/{review_id}/status")
 async def get_review_status(review_id: str):
