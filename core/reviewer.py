@@ -10,6 +10,7 @@ import uuid
 
 from core.gitlab_client import GitLabClient, FilePatchInfo
 from core.simple_ai_processor import SimpleAIProcessor
+from core.cache_service import CacheService
 from config.settings import settings, REVIEW_TYPES
 
 logger = logging.getLogger(__name__)
@@ -31,50 +32,53 @@ class ReviewResult:
 class GitLabReviewer:
     """GitLab代码审查器 - 主要入口类"""
     
-    def __init__(self, gitlab_url: str, access_token: str, 
+    def __init__(self, gitlab_url: str, access_token: str,
                  ai_model: Optional[str] = None):
         self.gitlab_url = gitlab_url
         self.access_token = access_token
         self.ai_model = ai_model or settings.default_ai_model
-        
+
         # 初始化客户端
         self.gitlab_client = GitLabClient(gitlab_url, access_token)
         self.ai_processor = SimpleAIProcessor(self.ai_model)
-        
+        self.cache_service = CacheService()
+
         # 审查状态追踪
         self.active_reviews = {}
     
-    async def review_file_patches(self, 
+    async def review_file_patches(self,
                                   diff_files: List[FilePatchInfo],
                                   review_type: str = "full",
-                                  mr_info: Optional[Dict] = None) -> Dict[str, Any]:
+                                  mr_info: Optional[Dict] = None,
+                                  historical_issues: Optional[Dict[str, List[Dict]]] = None) -> Dict[str, Any]:
         """
         审查文件补丁列表 - 这是新的核心审查方法
-        
+
         Args:
             diff_files: 文件补丁信息列表
             review_type: 审查类型
             mr_info: (可选) 关联的MR信息，用于丰富报告
-            
+            historical_issues: (可选) 历史问题字典，key为文件名，value为问题列表
+
         Returns:
             审查结果字典
         """
         review_id = str(uuid.uuid4())
         logger.info(f"Starting generic review {review_id} for {len(diff_files)} files.")
-        
+
         if not diff_files:
             return self._create_empty_review_result(review_id, "No changes to review")
-        
-        # AI分析
+
+        # AI分析（传递历史问题）
         ai_analysis = await self.ai_processor.analyze_merge_request(
-            diff_files, review_type, mr_info or {}
+            diff_files, review_type, mr_info or {}, historical_issues or {}
         )
-        
+
         # 构建最终结果
         result = self._build_review_result(
             review_id, review_type, ai_analysis, mr_info or {}, diff_files
         )
-        
+
         logger.info(f"Review {review_id} completed with score {result['score']}")
         return result
 
@@ -116,18 +120,45 @@ class GitLabReviewer:
             if review_id in self.active_reviews:
                 del self.active_reviews[review_id]
 
-    async def review_branch_comparison(self, project_id: str, 
+    async def review_branch_comparison(self, project_id: str,
                                        target_branch: str, source_branch: str,
-                                       review_type: str = "full") -> Dict[str, Any]:
+                                       review_type: str = "full",
+                                       task_id: Optional[str] = None) -> Dict[str, Any]:
         """
         审查两个分支的比较
+
+        Args:
+            project_id: 项目ID
+            target_branch: 目标分支（对比基准）
+            source_branch: 源分支（审查分支）
+            review_type: 审查类型
+            task_id: 任务/工作项/开发项目号（可选），用于历史问题追踪
+
+        Returns:
+            审查结果字典
         """
-        logger.info(f"Starting branch comparison review for {project_id}: {target_branch}...{source_branch}")
+        task_info = f" [task:{task_id}]" if task_id else ""
+        logger.info(f"Starting branch comparison review for {project_id}: {target_branch}...{source_branch}{task_info}")
+
+        # 执行实际审查
         async with self.gitlab_client:
             diff_files = await self.gitlab_client.compare_branches(
                 project_id, target_branch, source_branch
             )
-            
+
+            # 获取历史问题（如果有的话，会传递给 AI 作为上下文）
+            historical_issues = {}
+            if settings.enable_per_file_review:
+                try:
+                    async with self.cache_service:
+                        historical_issues = await self.cache_service.get_historical_issues(
+                            project_id, target_branch, task_id
+                        )
+                        if historical_issues:
+                            logger.info(f"Retrieved historical issues for {len(historical_issues)} files")
+                except Exception as e:
+                    logger.warning(f"Failed to get historical issues: {e}")
+
             # 为报告创建一个模拟的 mr_info 对象
             comparison_info = {
                 "title": f"Comparison: {source_branch} vs {target_branch}",
@@ -136,9 +167,23 @@ class GitLabReviewer:
                 "source_branch": source_branch,
                 "target_branch": target_branch
             }
-            
-            # 调用核心审查方法
-            result = await self.review_file_patches(diff_files, review_type, comparison_info)
+
+            # 调用核心审查方法（传递历史问题）
+            result = await self.review_file_patches(
+                diff_files, review_type, comparison_info, historical_issues
+            )
+
+            # 保存历史问题（用于下次增量审查）
+            if result.get("findings"):
+                try:
+                    async with self.cache_service:
+                        await self.cache_service.save_historical_issues(
+                            project_id, target_branch, result["findings"], task_id
+                        )
+                        logger.info(f"Saved {len(result['findings'])} historical issues")
+                except Exception as e:
+                    logger.warning(f"Failed to save historical issues: {e}")
+
             return result
     
     async def stream_review(self, project_id: str, mr_id: int,
@@ -280,10 +325,7 @@ class GitLabReviewer:
             "statistics": {"files_analyzed": 0},
             "metadata": {"review_timestamp": datetime.now().isoformat()}
         }
-    
-    
-    
-    
+
     def _generate_review_summary(self, review_result: Dict[str, Any]) -> str:
         """生成审查总结"""
         score = review_result.get("score", 0)

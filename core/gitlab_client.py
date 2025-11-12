@@ -194,12 +194,12 @@ class GitLabClient:
             async def limited_task(task):
                 async with semaphore:
                     return await task
-            
+
             results = await asyncio.gather(
                 *[limited_task(task) for task in tasks],
                 return_exceptions=True
             )
-            
+
             file_patches = []
             for result in results:
                 if isinstance(result, FilePatchInfo):

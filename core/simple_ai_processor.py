@@ -402,11 +402,12 @@ class SimpleAIProcessor:
         """检查AI客户端是否可用"""
         return self.client is not False
     
-    async def analyze_merge_request(self, diff_files: List[FilePatchInfo], 
-                                  review_type: str, mr_info: Dict) -> Dict[str, Any]:
+    async def analyze_merge_request(self, diff_files: List[FilePatchInfo],
+                                  review_type: str, mr_info: Dict,
+                                  historical_issues: Optional[Dict[str, List[Dict]]] = None) -> Dict[str, Any]:
         """分析MR的主入口函数"""
         import time
-        
+
         # 记录分析开始
         start_time = time.time()
         logger.info("🔍" + "=" * 80)
@@ -418,22 +419,25 @@ class SimpleAIProcessor:
         logger.info(f"  - AI模型: {self.model}")
         logger.info(f"  - AI客户端可用: {self._is_ai_available()}")
         logger.info(f"  - 逐文件审查: {settings.enable_per_file_review}")
-        
+        logger.info(f"  - 历史问题: {len(historical_issues or {})} 个文件有历史记录")
+
         logger.info(f"📁 变更文件列表:")
         for i, file_patch in enumerate(diff_files):
-            logger.info(f"  [{i+1}] {file_patch.filename} ({file_patch.edit_type})")
-            
+            has_history = file_patch.filename in (historical_issues or {})
+            history_mark = "📌 (有历史问题)" if has_history else ""
+            logger.info(f"  [{i+1}] {file_patch.filename} ({file_patch.edit_type}) {history_mark}")
+
         logger.info(f"🎯 MR信息:")
         logger.info(f"  - 标题: {mr_info.get('title', '未知')}")
         logger.info(f"  - 源分支: {mr_info.get('source_branch', '未知')}")
         logger.info(f"  - 目标分支: {mr_info.get('target_branch', '未知')}")
-        
+
         try:
             logger.info(f"⚡ 开始执行 {review_type} 类型审查...")
-            
+
             # 根据审查类型和配置选择分析策略
             if settings.enable_per_file_review and len(diff_files) > 1:
-                result = await self._per_file_analysis(diff_files, review_type, mr_info)
+                result = await self._per_file_analysis(diff_files, review_type, mr_info, historical_issues)
             elif review_type == "security":
                 result = await self._security_focused_analysis(diff_files, mr_info)
             elif review_type == "performance":
@@ -442,15 +446,15 @@ class SimpleAIProcessor:
                 result = await self._quick_analysis(diff_files, mr_info)
             else:  # full analysis
                 result = await self._comprehensive_analysis(diff_files, mr_info)
-            
+
             # 估算成本
             cost_estimate = self._estimate_analysis_cost(diff_files)
             result["cost_estimate"] = cost_estimate
-            
+
             # 记录分析完成
             end_time = time.time()
             analysis_time = end_time - start_time
-            
+
             logger.info("✅" + "=" * 80)
             logger.info("✅ 代码审查分析完成")
             logger.info("✅" + "=" * 80)
@@ -462,24 +466,24 @@ class SimpleAIProcessor:
             logger.info(f"  - 建议数: {len(result.get('suggestions', []))}")
             logger.info(f"  - 推荐数: {len(result.get('recommendations', []))}")
             logger.info(f"  - 成本估算: ${cost_estimate:.4f}")
-            
+
             if result.get('findings'):
                 logger.info(f"🔍 发现的主要问题:")
                 for i, finding in enumerate(result['findings'][:3]):  # 只显示前3个
                     logger.info(f"  [{i+1}] {finding.get('filename', 'N/A')}: {finding.get('message', finding.get('description', 'N/A'))}")
                 if len(result['findings']) > 3:
                     logger.info(f"  ... 还有 {len(result['findings']) - 3} 个问题")
-            
+
             logger.info(f"📝 总结: {result.get('summary', '无总结')}")
             logger.info("✅" + "=" * 80)
-            
+
             logger.info(f"Analysis completed with score: {result['score']}")
             return result
-            
+
         except Exception as e:
             end_time = time.time()
             analysis_time = end_time - start_time
-            
+
             logger.error("❌" + "=" * 80)
             logger.error("❌ 代码审查分析失败")
             logger.error("❌" + "=" * 80)
@@ -511,55 +515,58 @@ class SimpleAIProcessor:
         """异步上下文管理器出口"""
         await self._cleanup_client()
     
-    async def _per_file_analysis(self, diff_files: List[FilePatchInfo], 
-                               review_type: str, mr_info: Dict) -> Dict[str, Any]:
+    async def _per_file_analysis(self, diff_files: List[FilePatchInfo],
+                               review_type: str, mr_info: Dict,
+                               historical_issues: Optional[Dict[str, List[Dict]]] = None) -> Dict[str, Any]:
         """逐文件并行分析 - 新的核心方法"""
         logger.info(f"🚀 启动逐文件并行分析，文件数量: {len(diff_files)}")
         logger.info(f"🔧 最大并发数: {settings.max_concurrent_file_reviews}")
-        
+
         # 使用信号量控制并发数
         semaphore = asyncio.Semaphore(settings.max_concurrent_file_reviews)
-        
+
         async def analyze_single_file(file_patch: FilePatchInfo) -> Dict[str, Any]:
             async with semaphore:
-                return await self._analyze_single_file(file_patch, review_type)
-        
+                # 获取该文件的历史问题
+                file_historical_issues = (historical_issues or {}).get(file_patch.filename, [])
+                return await self._analyze_single_file(file_patch, review_type, file_historical_issues)
+
         # 并行处理所有文件
         start_time = time.time()
         tasks = [analyze_single_file(file_patch) for file_patch in diff_files]
         file_results = await asyncio.gather(*tasks, return_exceptions=True)
-        
+
         parallel_time = time.time() - start_time
         logger.info(f"⚡ 并行文件分析完成，耗时: {parallel_time:.2f}秒")
-        
+
         # 聚合结果
         all_findings = []
         all_suggestions = []
         failed_files = []
-        
+
         for i, result in enumerate(file_results):
             if isinstance(result, Exception):
                 logger.error(f"文件 {diff_files[i].filename} 分析失败: {result}")
                 failed_files.append(diff_files[i].filename)
                 continue
-            
+
             all_findings.extend(result.get("findings", []))
             all_suggestions.extend(result.get("suggestions", []))
-        
+
         # 生成全局总结
         global_summary = await self._generate_global_summary(
             all_findings, all_suggestions, mr_info, failed_files
         )
-        
+
         # 计算整体评分
         score = self._calculate_overall_score(all_findings, diff_files, failed_files)
-        
+
         logger.info(f"📊 逐文件分析完成:")
         logger.info(f"  - 成功分析文件: {len(diff_files) - len(failed_files)}")
         logger.info(f"  - 失败文件: {len(failed_files)}")
         logger.info(f"  - 总问题数: {len(all_findings)}")
         logger.info(f"  - 总建议数: {len(all_suggestions)}")
-        
+
         return {
             "type": f"{review_type}_per_file",
             "findings": all_findings[:30],  # 限制数量防止结果过大
@@ -571,53 +578,58 @@ class SimpleAIProcessor:
             "parallel_analysis_time": parallel_time
         }
     
-    async def _analyze_single_file(self, file_patch: FilePatchInfo, 
-                                 review_type: str) -> Dict[str, Any]:
+    async def _analyze_single_file(self, file_patch: FilePatchInfo,
+                                 review_type: str,
+                                 historical_issues: Optional[List[Dict]] = None) -> Dict[str, Any]:
         """分析单个文件"""
         import time
-        
+
         start_time = time.time()
         logger.info(f"📄 开始分析文件: {file_patch.filename}")
-        
+
+        if historical_issues:
+            logger.info(f"  📌 发现 {len(historical_issues)} 个历史问题需要关注")
+
         try:
             # 基础问题检测（本地，快速）
-            basic_issues = self._detect_basic_issues(file_patch)
-            
+            # basic_issues = self._detect_basic_issues(file_patch)
+
             # 构建完整文件内容用于AI分析
             full_file_content = self._prepare_file_content_for_analysis(file_patch)
-            
+
             # AI深度分析
             ai_findings = []
             ai_suggestions = []
-            
+
             if self._is_ai_available() and full_file_content:
                 try:
                     ai_result = await self._ai_single_file_analysis(
-                        file_patch, full_file_content, review_type
+                        file_patch, full_file_content, review_type, historical_issues
                     )
                     ai_findings = ai_result.get("findings", [])
                     ai_suggestions = ai_result.get("suggestions", [])
                 except Exception as e:
                     logger.warning(f"文件 {file_patch.filename} 的AI分析失败: {e}")
-            
+
             # 合并结果
-            all_findings = basic_issues + ai_findings
-            
+            #all_findings = basic_issues + ai_findings
+            all_findings = ai_findings
+
             end_time = time.time()
             analysis_time = end_time - start_time
-            
+
             logger.info(f"✅ 文件 {file_patch.filename} 分析完成 ({analysis_time:.2f}秒)")
             logger.info(f"    - 基础问题: {len(basic_issues)}个")
-            logger.info(f"    - AI发现问题: {len(ai_findings)}个") 
+            logger.info(f"    - AI发现问题: {len(ai_findings)}个")
             logger.info(f"    - AI建议: {len(ai_suggestions)}个")
-            
+
             return {
                 "filename": file_patch.filename,
                 "findings": all_findings,
                 "suggestions": ai_suggestions,
                 "analysis_time": analysis_time
             }
-            
+
         except Exception as e:
             end_time = time.time()
             logger.error(f"❌ 文件 {file_patch.filename} 分析失败: {e} ({end_time - start_time:.2f}秒)")
@@ -660,36 +672,68 @@ class SimpleAIProcessor:
 """
         return content_for_analysis.strip()
     
-    async def _ai_single_file_analysis(self, file_patch: FilePatchInfo, 
-                                     full_content: str, review_type: str) -> Dict[str, Any]:
+    async def _ai_single_file_analysis(self, file_patch: FilePatchInfo,
+                                     full_content: str, review_type: str,
+                                     historical_issues: Optional[List[Dict]] = None) -> Dict[str, Any]:
         """对单个文件进行AI分析"""
         if not self._is_ai_available():
             return {"findings": [], "suggestions": []}
-        
+
         # 根据审查类型构建不同的提示词
         focus_areas = REVIEW_TYPES.get(review_type, {}).get("focus_areas", ["quality"])
         focus_description = ", ".join(focus_areas)
-        
+
+        # 构建历史问题的提示 - 强制关注历史问题
+        historical_context = ""
+
+        if historical_issues:
+            historical_context = "\n\n🔴 **重要：本次审查为历史问题追踪模式**\n\n"
+            historical_context += "⚠️ **上一次审查发现的问题清单**：\n\n"
+
+            for i, issue in enumerate(historical_issues, 1):
+                historical_context += f"{i}. [{issue.get('severity', 'low').upper()}] {issue.get('type', 'unknown')}\n"
+                historical_context += f"   描述: {issue.get('description', 'N/A')}\n"
+                if issue.get('line_number'):
+                    historical_context += f"   位置: 第{issue.get('line_number')}行附近\n"
+                historical_context += f"   修复建议: {issue.get('suggestion', 'N/A')}\n\n"
+
+            historical_context += "\n🎯 **强制审查要求（极其重要）**：\n"
+            historical_context += "1. **仅关注历史问题**：只检查上述历史问题相关的代码区域是否有修改\n"
+            historical_context += "2. **检查修复状态**：对每个历史问题，判断本次 diff 中是否已修复\n"
+            historical_context += "3. **修复即清除**：如果历史问题已被正确修复且没有引入新的严重问题，返回空 findings []\n"
+            historical_context += "4. **问题持续**：如果历史问题仍然存在（代码未改或改得不对），在 findings 中报告\n"
+            historical_context += "5. **新问题严格限制**：除非是严重影响生产的新问题（如安全漏洞、崩溃风险），否则不要报告新问题\n"
+            historical_context += "6. **不要报告其他代码**：不要审查与历史问题无关的代码区域\n\n"
+            historical_context += "💡 **理想结果**：如果开发者正确修复了所有历史问题，你应该返回 findings: []\n\n"
+
         base_prompt = f"""
-请专门分析以下文件的代码质量，重点关注: {focus_description}
+请专门分析以下文件的代码变更。
 
 {full_content}
+{historical_context}
 
-分析要求：
-1. **避免重复发现**：对于同一个根本问题（如同一行的拼写错误），请将所有相关描述合并到一个发现中，不要分别报告为多个独立问题
-2. **合并相关问题**：如果多个问题源于同一根本原因或位于同一代码行，请整合为一个完整的描述
-3. **聚焦关键问题**：优先报告对代码功能和质量有重大影响的问题
-4. **结合上下文**：结合整个可能被截断的文件内容来评估，但重点关注diff部分的变更
-5. **避免误解**：我希望你审查的是diff部分，对于你觉得整个文件内容被截断请不需要给出其问题发现和建议，这个是因为避免上下文超限主动截断
+{'🔴 **审查模式：历史问题追踪模式**' if historical_issues else '📋 **审查模式：常规代码审查**'}
 
-请提供：
-1. 去重后的关键问题0-3个，每个问题包含完整的描述和解决方案
-2. 实用的改进建议
-3. 变更影响评估
+{'**审查要求（历史问题模式）**：' if historical_issues else '**分析要求**：'}
+{'''
+1. **只看历史问题区域**：仅检查上述历史问题所在的代码行及其周边代码在本次 diff 中的修改情况
+2. **判断修复状态**：
+   - 如果问题已修复且没引入新的严重bug → findings 返回空数组 []
+   - 如果问题未修复或修复不当 → findings 中报告该历史问题
+   - 如果引入了严重的新问题（如安全漏洞）→ findings 中报告新问题
+3. **严格限制新问题**：不要审查与历史问题无关的代码，不要报告小问题或建议性问题
+4. **目标**：帮助开发者确认历史问题是否已修复，而不是发现新问题
+''' if historical_issues else '''
+1. **避免重复发现**：对于同一个根本问题，合并到一个 finding
+2. **合并相关问题**：同一代码行的多个问题整合为一个描述
+3. **聚焦关键问题**：只报告对代码功能和质量有重大影响的问题（0-3个）
+4. **只审查 diff**：只关注 diff 部分的变更，不要审查整个文件内容
+5. **无伤大雅的问题不报告**：代码风格、注释建议等小问题不要报告
+'''}
 
-注意：这是单文件分析，避免重复报告相同或相似的问题。⚠️ 切记不允许你擅自关注整个文件内容，只关注diff部分，整个文件内容是指作为你审查diff的辅助信息
+注意：这是单文件分析。{' ⚠️ 本次是历史问题追踪，如果历史问题都已修复，请返回空的 findings: []' if historical_issues else ''}
 """
-        
+
         # 如果不支持结构化输出，添加JSON格式说明
         if not self.client._supports_structured_output(self.model):
             prompt = base_prompt + """
@@ -718,7 +762,7 @@ class SimpleAIProcessor:
 """
         else:
             prompt = base_prompt
-        
+
         try:
             response = await self.client.chat_completion(
                 messages=[
@@ -753,17 +797,17 @@ class SimpleAIProcessor:
                     "required": ["findings", "suggestions"]
                 }
             )
-            
+
             # 解析响应
             cleaned_response = self._extract_json_from_response(response)
-            
+
             try:
                 result = json.loads(cleaned_response)
                 logger.debug("Successfully parsed JSON response")
             except json.JSONDecodeError as e:
                 logger.error(f"JSON解析失败: {e}")
                 logger.error(f"尝试解析的JSON: {cleaned_response[:500]}...")
-                
+
                 # 尝试使用更激进的修复方法
                 try:
                     fixed_json = self._aggressive_json_fix(cleaned_response)
@@ -776,16 +820,16 @@ class SimpleAIProcessor:
                         "findings": [],
                         "suggestions": [f"AI分析失败，JSON解析错误: {str(e)[:100]}"]
                     }
-            
+
             # 验证并修复结果结构
             result = self._validate_and_fix_result(result)
-            
+
             # 为每个finding添加filename
             for finding in result.get("findings", []):
                 finding["filename"] = file_patch.filename
-            
+
             return result
-            
+
         except Exception as e:
             logger.error(f"AI单文件分析失败: {e}")
             return {"findings": [], "suggestions": []}

@@ -228,7 +228,7 @@ class EsbWrapper:
         return {
             "RspInfo": rsp_info_dto.to_dict(),
             "Response": {
-                "output": business_data
+                "OutPut": business_data
             }
         }
 

@@ -1,18 +1,20 @@
 """
 FastAPI主应用 - GitLab代码审查服务的REST API接口
+重构版本：只保留 /review 接口，全部通过 ESB 集成
 """
-import asyncio
+import uuid
 import logging
 from typing import Dict, List, Optional, Any
 from datetime import datetime
 import uvicorn
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Depends, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse, JSONResponse
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator
-import os
 
 from core.reviewer import GitLabReviewer
+from core.task_manager import init_task_manager, cleanup_task_manager, get_task_manager
+from core.redis_client import get_redis_manager, close_redis_connection
 from config.settings import settings, REVIEW_TYPES
 from api.esb_middleware import EsbMiddleware
 
@@ -26,7 +28,7 @@ logger = logging.getLogger(__name__)
 # 创建FastAPI应用
 app = FastAPI(
     title="GitLab Code Reviewer",
-    description="基于AI的GitLab代码审查服务",
+    description="基于AI的GitLab代码审查服务 - ESB集成版",
     version=settings.service_version,
     docs_url="/docs",
     redoc_url="/redoc"
@@ -41,29 +43,25 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 添加 ESB 中间件
-# 配置说明：
-# - ["/esb/"] - 仅对 /esb/ 开头的路径启用 ESB 包裹
-# - ["/"] - 对所有路径启用 ESB 包裹（包括 /review, /health 等）
-# - ["/review", "/esb/"] - 对指定的多个路径启用
+# 添加 ESB 中间件 - 所有 /review 开头的路径都通过 ESB
 app.add_middleware(
     EsbMiddleware,
-    esb_enabled_paths=["/review"]  # 修改为 ["/"] 可让所有接口都支持 ESB
+    esb_enabled_paths=["/review"]
 )
 
 # Pydantic模型定义
 class ReviewRequest(BaseModel):
     """审查请求模型 - 支持MR和分支比较模式"""
     gitlab_url: str = Field(..., description="GitLab实例URL")
-    project_id: str = Field(..., description="项目ID") 
+    project_id: str = Field(..., description="项目ID")
     access_token: str = Field(..., description="GitLab访问令牌")
-    
+
     # 模式选择
     mode: str = Field(default="mr", description="审查模式: 'mr' 或 'branch_compare'")
-    
+
     # MR模式所需参数
     mr_id: Optional[int] = Field(default=None, gt=0, description="Merge Request ID (mode='mr'时必需)")
-    
+
     # 分支比较模式所需参数
     target_branch: Optional[str] = Field(default=None, description="目标分支 (mode='branch_compare'时必需)")
     source_branch: Optional[str] = Field(default=None, description="源分支 (mode='branch_compare'时必需)")
@@ -71,20 +69,21 @@ class ReviewRequest(BaseModel):
     review_type: str = Field(default="full", description="审查类型")
     ai_model: Optional[str] = Field(default=None, description="AI模型名称")
     options: Optional[Dict[str, Any]] = Field(default_factory=dict, description="额外选项")
-    
+
     @field_validator('review_type')
     @classmethod
     def validate_review_type(cls, v):
         if v not in REVIEW_TYPES:
             raise ValueError(f'review_type must be one of: {list(REVIEW_TYPES.keys())}')
         return v
-    
+
     @field_validator('gitlab_url')
     @classmethod
     def validate_gitlab_url(cls, v):
         if not v.startswith(('http://', 'https://')):
             raise ValueError('gitlab_url must start with http:// or https://')
         return v.rstrip('/')
+
 
 class ReviewResponse(BaseModel):
     """审查响应模型"""
@@ -105,10 +104,11 @@ class HealthResponse(BaseModel):
     status: str
     version: str
     timestamp: str
-    uptime: str
+
 
 # 全局变量
 app_start_time = datetime.now()
+
 
 # 依赖函数
 async def get_reviewer(request: ReviewRequest) -> GitLabReviewer:
@@ -127,200 +127,122 @@ async def get_reviewer(request: ReviewRequest) -> GitLabReviewer:
             detail=f"Failed to initialize reviewer: {str(e)}"
         )
 
-# API路由定义
 
-@app.get("/", response_model=Dict[str, str])
-async def root():
-    """根路径 - API信息"""
-    return {
-        "message": "GitLab Code Reviewer API",
-        "version": settings.service_version,
-        "docs": "/docs",
-        "health": "/health"
-    }
-
-@app.get("/health", response_model=HealthResponse)
-async def health_check():
-    """健康检查"""
-    uptime = datetime.now() - app_start_time
-    return HealthResponse(
-        status="healthy",
-        version=settings.service_version,
-        timestamp=datetime.now().isoformat(),
-        uptime=str(uptime)
-    )
-
-@app.get("/review-types")
-async def get_review_types():
-    """获取支持的审查类型"""
-    return {
-        "review_types": REVIEW_TYPES,
-        "description": "支持的代码审查类型及其说明"
-    }
-
-@app.post("/review", response_model=ReviewResponse)
-async def review_merge_request(
-    request: ReviewRequest,
-    background_tasks: BackgroundTasks,
-    reviewer: GitLabReviewer = Depends(get_reviewer)
-):
+async def execute_review_task(task_id: str, request: ReviewRequest):
     """
-    执行完整的MR代码审查
-    
-    这是主要的审查接口，支持同步返回完整的审查结果。
+    后台执行审查任务
+
+    Args:
+        task_id: 任务ID
+        request: 审查请求
     """
     try:
-        logger.info(f"Starting review for project {request.project_id}")
-        
+        task_mgr = get_task_manager()
+
+        # 进度回调函数
+        async def update_progress(progress: int, message: str):
+            await task_mgr.update_progress(task_id, progress, message)
+
+        # 更新进度：开始
+        await update_progress(10, "初始化审查器...")
+
+        # 创建审查器
+        reviewer = GitLabReviewer(
+            gitlab_url=request.gitlab_url,
+            access_token=request.access_token,
+            ai_model=request.ai_model
+        )
+
+        await update_progress(20, "开始执行审查...")
+
+        # 执行审查（根据模式）
         if request.mode == "mr":
             if not request.mr_id:
-                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="mr_id is required for 'mr' mode")
-            
-            logger.info(f"Mode: MR review for !{request.mr_id}")
+                raise ValueError("mr_id is required for 'mr' mode")
+
+            await update_progress(30, f"审查 MR !{request.mr_id}...")
             result = await reviewer.review_merge_request(
                 project_id=request.project_id,
                 mr_id=request.mr_id,
                 review_type=request.review_type,
                 options=request.options
             )
-        
+
         elif request.mode == "branch_compare":
             if not request.target_branch or not request.source_branch:
-                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="target_branch and source_branch are required for 'branch_compare' mode")
-            
-            logger.info(f"Mode: Branch comparison between '{request.source_branch}' and '{request.target_branch}'")
+                raise ValueError("target_branch and source_branch are required for 'branch_compare' mode")
+
+            await update_progress(30, f"比较分支 {request.source_branch} vs {request.target_branch}...")
             result = await reviewer.review_branch_comparison(
                 project_id=request.project_id,
                 target_branch=request.target_branch,
                 source_branch=request.source_branch,
                 review_type=request.review_type
             )
-            
         else:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Invalid mode: '{request.mode}'. Must be 'mr' or 'branch_compare'.")
+            raise ValueError(f"Invalid mode: {request.mode}")
 
-        logger.info(f"Review completed with score {result['score']}")
-        return ReviewResponse(**result)
-        
-    except ValueError as e:
-        logger.error(f"Validation error: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=str(e)
-        )
-    except Exception as e:
-        logger.error(f"Review failed: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Review failed: {str(e)}"
-        )
+        await update_progress(90, "审查完成，保存结果...")
 
-@app.post("/review/stream")
-async def stream_review(request: ReviewRequest):
-    """
-    流式代码审查 - 实时返回进度和结果
-    
-    适合长时间的审查任务，可以实时显示进度。
-    """
-    try:
-        async def generate_stream():
-            try:
-                reviewer = GitLabReviewer(
-                    gitlab_url=request.gitlab_url,
-                    access_token=request.access_token,
-                    ai_model=request.ai_model
-                )
-                
-                async for chunk in reviewer.stream_review(
-                    project_id=request.project_id,
-                    mr_id=request.mr_id,
-                    review_type=request.review_type
-                ):
-                    yield f"data: {chunk}\n\n"
-                    
-            except Exception as e:
-                error_data = {
-                    "type": "error",
-                    "message": str(e),
-                    "timestamp": datetime.now().isoformat()
-                }
-                yield f"data: {error_data}\n\n"
-        
-        return StreamingResponse(
-            generate_stream(),
-            media_type="text/plain",
-            headers={"Cache-Control": "no-cache", "Connection": "keep-alive"}
-        )
-        
-    except Exception as e:
-        logger.error(f"Stream review failed: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Stream review failed: {str(e)}"
-        )
-
-
-@app.post("/review/update-mr")
-async def update_mr_with_review(
-    gitlab_url: str,
-    project_id: str,
-    mr_id: int,
-    access_token: str,
-    review_result: Dict[str, Any]
-):
-    """
-    用审查结果更新MR描述
-
-    将审查总结添加到MR描述中。
-    """
-    try:
-        reviewer = GitLabReviewer(gitlab_url, access_token)
-
-        success = await reviewer.update_mr_with_review(
-            project_id=project_id,
-            mr_id=mr_id,
-            review_result=review_result
-        )
-
-        if success:
-            return {"status": "success", "message": "MR updated successfully"}
-        else:
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Failed to update MR"
-            )
+        # 完成任务
+        await task_mgr.complete_task(task_id, result)
+        await update_progress(100, "任务完成")
 
     except Exception as e:
-        logger.error(f"Failed to update MR: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to update MR: {str(e)}"
-        )
+        logger.error(f"Task {task_id} failed: {e}")
+        task_mgr = get_task_manager()
+        await task_mgr.fail_task(task_id, str(e))
 
 
-# ESB 专用路由
-@app.post("/esb/review")
-async def esb_review_merge_request(
+# ============================================================================
+# API 路由定义 - 所有路由都通过 ESB 中间件
+# ============================================================================
+
+@app.get("/", response_model=Dict[str, str])
+async def root():
+    """根路径 - API信息"""
+    return {
+        "message": "GitLab Code Reviewer API - ESB Integration",
+        "version": settings.service_version,
+        "docs": "/docs",
+        "health": "/health"
+    }
+
+
+@app.get("/health", response_model=HealthResponse)
+async def health_check():
+    """健康检查"""
+    return HealthResponse(
+        status="healthy",
+        version=settings.service_version,
+        timestamp=datetime.now().isoformat()
+    )
+
+
+@app.post("/review", response_model=ReviewResponse)
+async def review_merge_request(
     request: ReviewRequest,
-    background_tasks: BackgroundTasks,
     reviewer: GitLabReviewer = Depends(get_reviewer)
 ):
     """
-    ESB 格式的代码审查接口
+    执行同步代码审查（通过 ESB）
 
-    此接口会自动处理 ESB 请求和响应的包裹：
-    - 请求格式: { "ReqInfo": {...}, "Request": {...} }
-    - 响应格式: { "RspInfo": {...}, "Response": {...} }
+    支持两种模式：
+    - mr: 审查指定的 Merge Request
+    - branch_compare: 比较两个分支
 
-    注意：ESB 中间件会自动解包请求和包裹响应，
-    业务逻辑只需处理 Request 和 Response 部分。
+    此接口会立即返回审查结果（可能耗时较长）
+    对于长时间任务，建议使用 /review/async 接口
     """
     try:
-        logger.info(f"[ESB] Starting review for project {request.project_id}")
+        logger.info(f"[ESB] Starting sync review for project {request.project_id}")
 
         if request.mode == "mr":
             if not request.mr_id:
-                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="mr_id is required for 'mr' mode")
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="mr_id is required for 'mr' mode"
+                )
 
             logger.info(f"[ESB] Mode: MR review for !{request.mr_id}")
             result = await reviewer.review_merge_request(
@@ -332,7 +254,10 @@ async def esb_review_merge_request(
 
         elif request.mode == "branch_compare":
             if not request.target_branch or not request.source_branch:
-                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="target_branch and source_branch are required for 'branch_compare' mode")
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="target_branch and source_branch are required for 'branch_compare' mode"
+                )
 
             logger.info(f"[ESB] Mode: Branch comparison between '{request.source_branch}' and '{request.target_branch}'")
             result = await reviewer.review_branch_comparison(
@@ -343,11 +268,12 @@ async def esb_review_merge_request(
             )
 
         else:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Invalid mode: '{request.mode}'. Must be 'mr' or 'branch_compare'.")
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Invalid mode: '{request.mode}'. Must be 'mr' or 'branch_compare'."
+            )
 
         logger.info(f"[ESB] Review completed with score {result['score']}")
-
-        # 注意：返回的数据会被 ESB 中间件自动包裹到 Response 字段中
         return ReviewResponse(**result)
 
     except ValueError as e:
@@ -364,22 +290,152 @@ async def esb_review_merge_request(
         )
 
 
-@app.get("/review/{review_id}/status")
-async def get_review_status(review_id: str):
+@app.post("/review/async")
+async def async_review(request: ReviewRequest, background_tasks: BackgroundTasks):
     """
-    获取审查状态
-    
-    用于查询正在进行中的审查状态。
+    提交异步审查任务（通过 ESB） - 立即返回任务ID
+
+    适用于长时间运行的审查任务，客户端可以通过轮询获取进度和结果
+
+    返回：
+    - task_id: 任务ID
+    - status: 任务状态
+    - message: 提示信息
+    - progress_url: 进度查询URL
+    - result_url: 结果查询URL
     """
-    # 这里需要实现状态查询逻辑
-    # 可以使用Redis或数据库存储审查状态
-    return {
-        "message": "Status tracking not implemented yet",
-        "review_id": review_id
-    }
+    try:
+        task_id = str(uuid.uuid4())
+        task_mgr = get_task_manager()
+
+        # 创建任务
+        await task_mgr.create_task(task_id)
+
+        # 后台执行
+        background_tasks.add_task(
+            execute_review_task,
+            task_id,
+            request
+        )
+
+        logger.info(f"[ESB] Async task {task_id} created for project {request.project_id}")
+
+        return {
+            "task_id": task_id,
+            "status": "pending",
+            "message": "任务已提交，请使用task_id查询进度",
+            "progress_url": f"/review/{task_id}/progress",
+            "result_url": f"/review/{task_id}/result"
+        }
+
+    except Exception as e:
+        logger.error(f"[ESB] Failed to create async review task: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to create task: {str(e)}"
+        )
 
 
+@app.get("/review/{task_id}/progress")
+async def get_task_progress(task_id: str):
+    """
+    获取任务进度（通过 ESB）
+
+    返回当前任务的执行状态和进度百分比
+
+    返回：
+    - task_id: 任务ID
+    - status: 任务状态 (pending/running/completed/failed)
+    - progress: 进度百分比 (0-100)
+    - message: 当前状态消息
+    - created_at: 任务创建时间
+    - updated_at: 最后更新时间
+    """
+    try:
+        task_mgr = get_task_manager()
+        task = await task_mgr.get_task(task_id)
+
+        if not task:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Task {task_id} not found"
+            )
+
+        return {
+            "task_id": task_id,
+            "status": task.status,
+            "progress": task.progress,
+            "message": task.message,
+            "created_at": task.created_at,
+            "updated_at": task.updated_at
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[ESB] Failed to get task progress: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to get progress: {str(e)}"
+        )
+
+
+@app.get("/review/{task_id}/result")
+async def get_task_result(task_id: str):
+    """
+    获取任务结果（通过 ESB）
+
+    如果任务完成，返回完整的审查结果；否则返回当前状态
+
+    返回：
+    - 如果 completed: { task_id, status: "completed", result: {...} }
+    - 如果 failed: { task_id, status: "failed", error: "..." }
+    - 如果 pending/running: { task_id, status, progress, message }
+    """
+    try:
+        task_mgr = get_task_manager()
+        task = await task_mgr.get_task(task_id)
+
+        if not task:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Task {task_id} not found"
+            )
+
+        if task.status == "completed":
+            return {
+                "task_id": task_id,
+                "status": "completed",
+                "result": task.result
+            }
+        elif task.status == "failed":
+            return {
+                "task_id": task_id,
+                "status": "failed",
+                "error": task.error
+            }
+        else:
+            return {
+                "task_id": task_id,
+                "status": task.status,
+                "progress": task.progress,
+                "message": task.message
+            }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[ESB] Failed to get task result: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to get result: {str(e)}"
+        )
+
+
+# ============================================================================
 # 错误处理
+# ============================================================================
+
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request, exc):
     """HTTP异常处理器"""
@@ -393,6 +449,7 @@ async def http_exception_handler(request, exc):
             "timestamp": datetime.now().isoformat()
         }
     )
+
 
 @app.exception_handler(Exception)
 async def general_exception_handler(request, exc):
@@ -408,18 +465,47 @@ async def general_exception_handler(request, exc):
         }
     )
 
-# 启动事件
+
+# ============================================================================
+# 启动/关闭事件
+# ============================================================================
+
 @app.on_event("startup")
 async def startup_event():
     """应用启动事件"""
     logger.info(f"GitLab Code Reviewer API v{settings.service_version} starting up")
+    logger.info(f"ESB Integration: Enabled for /review paths")
     logger.info(f"Debug mode: {settings.debug}")
     logger.info(f"Default AI model: {settings.default_ai_model}")
+
+    # 初始化共享的 Redis 连接
+    logger.info(f"Initializing shared Redis connection: {settings.redis_url}")
+    redis_manager = get_redis_manager()
+    redis_client = await redis_manager.connect()
+
+    if redis_client:
+        logger.info("✓ Redis connection successful")
+    else:
+        logger.warning("✗ Redis connection failed - cache and tasks may not work")
+
+    # 初始化 TaskManager（现在使用共享的 Redis 连接）
+    logger.info("Initializing TaskManager (using shared Redis connection)")
+    init_task_manager(task_ttl=settings.redis_task_ttl)
+
 
 @app.on_event("shutdown")
 async def shutdown_event():
     """应用关闭事件"""
     logger.info("GitLab Code Reviewer API shutting down")
+
+    # 清理 TaskManager
+    await cleanup_task_manager()
+    logger.info("TaskManager cleaned up")
+
+    # 关闭共享的 Redis 连接
+    await close_redis_connection()
+    logger.info("Redis connection closed")
+
 
 # 开发模式启动
 if __name__ == "__main__":

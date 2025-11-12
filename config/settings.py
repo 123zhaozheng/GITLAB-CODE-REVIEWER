@@ -32,7 +32,10 @@ class Settings(BaseSettings):
     
     # 数据库配置
     database_url: str = Field(default="sqlite:///./app.db", env="DATABASE_URL")
-    redis_url: Optional[str] = Field(default=None, env="REDIS_URL")
+
+    # Redis 配置
+    redis_url: str = Field(default="redis://localhost:6379/0", env="REDIS_URL")
+    redis_task_ttl: int = Field(default=86400, env="REDIS_TASK_TTL")  # 任务过期时间（秒），默认24小时
     
     # 性能配置
     max_concurrent_reviews: int = Field(default=10, env="MAX_CONCURRENT_REVIEWS")
