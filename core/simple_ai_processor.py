@@ -942,7 +942,7 @@ MR信息：
         
         return {
             "type": "comprehensive",
-            "findings": all_findings[:20],  # 限制数量
+            "findings": all_findings[:200],  # 限制数量
             "suggestions": all_suggestions[:10],
             "recommendations": self._generate_recommendations(all_findings),
             "score": score,

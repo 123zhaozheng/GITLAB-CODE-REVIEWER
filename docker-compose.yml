@@ -26,6 +26,10 @@ services:
     volumes:
       - ./logs:/app/logs
       - ./.env:/app/.env:ro
+      # 挂载源代码目录以实现实时更新（开发模式）
+      - ./core:/app/core
+      - ./api:/app/api
+      - ./config:/app/config
     depends_on:
       - redis
       - postgres

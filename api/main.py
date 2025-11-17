@@ -66,6 +66,9 @@ class ReviewRequest(BaseModel):
     target_branch: Optional[str] = Field(default=None, description="目标分支 (mode='branch_compare'时必需)")
     source_branch: Optional[str] = Field(default=None, description="源分支 (mode='branch_compare'时必需)")
 
+    # 历史问题追踪
+    devops_task_id: Optional[str] = Field(default=None, description="DevOps任务/工作项编号（用于历史问题追踪和复检）")
+
     review_type: str = Field(default="full", description="审查类型")
     ai_model: Optional[str] = Field(default=None, description="AI模型名称")
     options: Optional[Dict[str, Any]] = Field(default_factory=dict, description="额外选项")
@@ -177,7 +180,8 @@ async def execute_review_task(task_id: str, request: ReviewRequest):
                 project_id=request.project_id,
                 target_branch=request.target_branch,
                 source_branch=request.source_branch,
-                review_type=request.review_type
+                review_type=request.review_type,
+                task_id=request.devops_task_id
             )
         else:
             raise ValueError(f"Invalid mode: {request.mode}")
@@ -264,7 +268,8 @@ async def review_merge_request(
                 project_id=request.project_id,
                 target_branch=request.target_branch,
                 source_branch=request.source_branch,
-                review_type=request.review_type
+                review_type=request.review_type,
+                task_id=request.devops_task_id
             )
 
         else:
