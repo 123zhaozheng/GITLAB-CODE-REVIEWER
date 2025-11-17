@@ -316,6 +316,77 @@ class CacheService:
             logger.error(f"Error saving historical issues: {e}")
             return False
 
+    # ---------------------------------------------------------------------
+    # 重复审查（按分支+任务）去重：当 project_id + source_branch + target_branch + task_id 相同，
+    # 直接返回上一次的审查结果（包含相同的 review_id）
+    # ---------------------------------------------------------------------
+    def _generate_duplicate_key(self, project_id: str, source_branch: str,
+                                target_branch: str, task_id: Optional[str] = None) -> str:
+        """
+        生成重复审查检测用的key（不使用commit，按分支+任务维度）
+
+        说明：
+            - 与 get_cached_review（commit 级别缓存）互补
+            - 仅用于用户期望的“相同参数直接复用上一次结果”的场景
+        """
+        task_part = task_id or ""
+        key_components = f"{project_id}:{source_branch}:{target_branch}:{task_part}"
+        key_hash = hashlib.sha256(key_components.encode()).hexdigest()[:16]
+        return f"review:dedup:{key_hash}"
+
+    async def get_duplicate_review(self, project_id: str, source_branch: str,
+                                   target_branch: str, task_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        """
+        获取按分支+任务维度的最近一次审查结果
+
+        命中时直接返回完整结果，并附加 from_cache=True
+        """
+        redis_client = await self._get_redis()
+        if not redis_client:
+            return None
+
+        try:
+            dup_key = self._generate_duplicate_key(project_id, source_branch, target_branch, task_id)
+            cached_data = await redis_client.get(dup_key)
+            task_info = f" [task:{task_id}]" if task_id else ""
+
+            if cached_data:
+                logger.info(f"Duplicate HIT for review: {project_id} {source_branch}→{target_branch}{task_info}")
+                result = json.loads(cached_data)
+                result["from_cache"] = True
+                return result
+            else:
+                logger.info(f"Duplicate MISS for review: {project_id} {source_branch}→{target_branch}{task_info}")
+                return None
+        except Exception as e:
+            logger.error(f"Error getting duplicate review: {e}")
+            return None
+
+    async def cache_duplicate_review(self, project_id: str, source_branch: str,
+                                     target_branch: str, review_result: Dict[str, Any],
+                                     task_id: Optional[str] = None) -> bool:
+        """
+        缓存最近一次按分支+任务维度的审查结果（用于重复审查直接返回）
+        """
+        redis_client = await self._get_redis()
+        if not redis_client:
+            return False
+
+        try:
+            dup_key = self._generate_duplicate_key(project_id, source_branch, target_branch, task_id)
+            cached_data = json.dumps(review_result, ensure_ascii=False)
+            await redis_client.setex(
+                dup_key,
+                int(self.review_cache_ttl.total_seconds()),
+                cached_data
+            )
+            task_info = f" [task:{task_id}]" if task_id else ""
+            logger.info(f"Cached duplicate mapping for: {project_id} {source_branch}→{target_branch}{task_info}")
+            return True
+        except Exception as e:
+            logger.error(f"Error caching duplicate review: {e}")
+            return False
+
     async def clear_review_cache(self, project_id: str, source_commit: str,
                                 target_branch: str, review_type: Optional[str] = None,
                                 task_id: Optional[str] = None) -> bool:

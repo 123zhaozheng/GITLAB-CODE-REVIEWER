@@ -188,9 +188,8 @@ async def execute_review_task(task_id: str, request: ReviewRequest):
 
         await update_progress(90, "审查完成，保存结果...")
 
-        # 完成任务
+        # 完成任务（会自动设置状态为completed，进度为100）
         await task_mgr.complete_task(task_id, result)
-        await update_progress(100, "任务完成")
 
     except Exception as e:
         logger.error(f"Task {task_id} failed: {e}")

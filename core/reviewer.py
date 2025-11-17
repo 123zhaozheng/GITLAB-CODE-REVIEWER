@@ -140,6 +140,19 @@ class GitLabReviewer:
         task_info = f" [task:{task_id}]" if task_id else ""
         logger.info(f"Starting branch comparison review for {project_id}: {target_branch}...{source_branch}{task_info}")
 
+        # 如果是完全重复的审查（按 项目 + 源分支 + 目标分支 + 任务ID 去重），直接返回上一次结果
+        try:
+            async with self.cache_service:
+                dup = await self.cache_service.get_duplicate_review(
+                    project_id, source_branch, target_branch, task_id
+                )
+            # 为避免不同审查类型间串用，命中后再校验一次类型
+            if dup and dup.get("review_type") == review_type:
+                logger.info(f"Returning previous review result due to duplicate parameters{task_info}")
+                return dup
+        except Exception as e:
+            logger.warning(f"Duplicate review check failed, fallback to normal flow: {e}")
+
         # 执行实际审查
         async with self.gitlab_client:
             diff_files = await self.gitlab_client.compare_branches(
@@ -172,6 +185,15 @@ class GitLabReviewer:
             result = await self.review_file_patches(
                 diff_files, review_type, comparison_info, historical_issues
             )
+
+            # 缓存一次“重复审查映射”，下次同参直接复用同一个 review_id
+            try:
+                async with self.cache_service:
+                    await self.cache_service.cache_duplicate_review(
+                        project_id, source_branch, target_branch, result, task_id
+                    )
+            except Exception as e:
+                logger.warning(f"Failed to cache duplicate mapping: {e}")
 
             # 保存历史问题（用于下次增量审查）
             if result.get("findings"):
