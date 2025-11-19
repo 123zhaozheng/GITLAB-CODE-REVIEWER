@@ -8,6 +8,7 @@ from typing import Dict, List, Optional, Any
 from datetime import datetime
 import uvicorn
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Depends, status
+from fastapi import APIRouter
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator
@@ -16,7 +17,7 @@ from core.reviewer import GitLabReviewer
 from core.task_manager import init_task_manager, cleanup_task_manager, get_task_manager
 from core.redis_client import get_redis_manager, close_redis_connection
 from config.settings import settings, REVIEW_TYPES
-from api.esb_middleware import EsbMiddleware
+from api.esb_dependency import EsbRoute
 
 # 配置日志
 logging.basicConfig(
@@ -43,11 +44,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 添加 ESB 中间件 - 所有 /review 开头的路径都通过 ESB
-app.add_middleware(
-    EsbMiddleware,
-    esb_enabled_paths=["/review"]
-)
+# 路由级 ESB 包装：仅对需要的接口启用（替代全局中间件）
+esb_router = APIRouter(route_class=EsbRoute)
 
 # Pydantic模型定义
 class ReviewRequest(BaseModel):
@@ -222,7 +220,7 @@ async def health_check():
     )
 
 
-@app.post("/review", response_model=ReviewResponse)
+@esb_router.post("/review", response_model=ReviewResponse)
 async def review_merge_request(
     request: ReviewRequest,
     reviewer: GitLabReviewer = Depends(get_reviewer)
@@ -294,7 +292,7 @@ async def review_merge_request(
         )
 
 
-@app.post("/review/async")
+@esb_router.post("/review/async")
 async def async_review(request: ReviewRequest, background_tasks: BackgroundTasks):
     """
     提交异步审查任务（通过 ESB） - 立即返回任务ID
@@ -340,7 +338,7 @@ async def async_review(request: ReviewRequest, background_tasks: BackgroundTasks
         )
 
 
-@app.get("/review/{task_id}/progress")
+@esb_router.get("/review/{task_id}/progress")
 async def get_task_progress(task_id: str):
     """
     获取任务进度（通过 ESB）
@@ -384,7 +382,7 @@ async def get_task_progress(task_id: str):
         )
 
 
-@app.get("/review/{task_id}/result")
+@esb_router.get("/review/{task_id}/result")
 async def get_task_result(task_id: str):
     """
     获取任务结果（通过 ESB）
@@ -478,7 +476,7 @@ async def general_exception_handler(request, exc):
 async def startup_event():
     """应用启动事件"""
     logger.info(f"GitLab Code Reviewer API v{settings.service_version} starting up")
-    logger.info(f"ESB Integration: Enabled for /review paths")
+    logger.info("ESB Integration: Enabled via route-level wrapper (EsbRoute) for /review endpoints")
     logger.info(f"Debug mode: {settings.debug}")
     logger.info(f"Default AI model: {settings.default_ai_model}")
 
@@ -509,6 +507,10 @@ async def shutdown_event():
     # 关闭共享的 Redis 连接
     await close_redis_connection()
     logger.info("Redis connection closed")
+
+
+# 挂载仅对 /review* 生效的 ESB 路由
+app.include_router(esb_router)
 
 
 # 开发模式启动

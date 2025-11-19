@@ -183,21 +183,26 @@ class EsbWrapper:
 
         Args:
             esb_request: ESB 格式的请求，包含 ReqInfo 和 Request
-                        Request 中还包含 input 字段
+                        Request 中包含 Input 字段（兼容大小写：Input/input/InPut/INPUT）
 
         Returns:
-            Dict: 业务请求数据（Request.input 部分）
+            Dict: 业务请求数据（Request.Input 部分）
         """
         if "Request" not in esb_request:
             raise ValueError("Invalid ESB request: missing 'Request' field")
 
         request_data = esb_request["Request"]
 
-        # 检查是否有 input 字段
-        if "input" not in request_data:
-            raise ValueError("Invalid ESB request: missing 'input' field in Request")
+        # 兼容不同大小写的 Input 字段命名
+        for key in ("Input", "input", "InPut", "INPUT"):
+            if key in request_data:
+                return request_data[key]
 
-        return request_data["input"]
+        # 兜底：若业务侧直接把业务对象放在 Request 顶层（无 Input），则尝试直接使用
+        if isinstance(request_data, dict) and request_data:
+            return request_data
+
+        raise ValueError("Invalid ESB request: missing 'Input' field in Request")
 
     @staticmethod
     def wrap_response(

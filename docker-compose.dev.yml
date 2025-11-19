@@ -1,0 +1,103 @@
+# GitLab Code Reviewer - Docker Compose 开发配置
+# 用于本地开发，支持代码热重载
+
+version: '3.8'
+
+services:
+  # 主要的代码审查服务（开发模式）
+  reviewer-api:
+    build: .
+    container_name: gitlab-code-reviewer-dev
+    ports:
+      - "8000:8000"
+    environment:
+      # 从环境变量或.env文件读取
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - OPENAI_API_BASE=${OPENAI_API_BASE}
+      - OPENAI_API_URL=${OPENAI_API_URL}
+      - AI_PROVIDER=${AI_PROVIDER:-openai}
+      - CUSTOM_LLM_PROVIDER=${CUSTOM_LLM_PROVIDER}
+      - DEFAULT_AI_MODEL=${DEFAULT_AI_MODEL:-gpt-4}
+      - FALLBACK_AI_MODEL=${FALLBACK_AI_MODEL:-gpt-3.5-turbo}
+      - LOG_LEVEL=${LOG_LEVEL:-DEBUG}
+      - DEBUG=true
+      - REDIS_URL=redis://redis:6379/0
+      - DATABASE_URL=postgresql://reviewer:password@postgres:5432/reviewer_db
+    volumes:
+      - ./logs:/app/logs
+      - ./.env:/app/.env:ro
+      # 挂载源代码目录以实现实时更新
+      - ./core:/app/core
+      - ./api:/app/api
+      - ./config:/app/config
+      - ./__init__.py:/app/__init__.py
+    depends_on:
+      - redis
+      - postgres
+    # 使用 --reload 参数启用热重载
+    command: ["uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+    restart: unless-stopped
+    networks:
+      - reviewer-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  # Redis缓存服务
+  redis:
+    image: redis:7-alpine
+    container_name: reviewer-redis-dev
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data_dev:/data
+    command: redis-server --appendonly yes --maxmemory 512mb --maxmemory-policy allkeys-lru
+    restart: unless-stopped
+    networks:
+      - reviewer-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  # PostgreSQL数据库（可选，用于存储审查历史）
+  postgres:
+    image: postgres:15-alpine
+    container_name: reviewer-postgres-dev
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_DB: reviewer_db
+      POSTGRES_USER: reviewer
+      POSTGRES_PASSWORD: password
+      POSTGRES_INITDB_ARGS: "--encoding=UTF-8"
+    volumes:
+      - postgres_data_dev:/var/lib/postgresql/data
+    restart: unless-stopped
+    networks:
+      - reviewer-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U reviewer -d reviewer_db"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+# 数据卷定义
+volumes:
+  redis_data_dev:
+    driver: local
+  postgres_data_dev:
+    driver: local
+
+# 网络定义
+networks:
+  reviewer-network:
+    driver: bridge
+    ipam:
+      driver: default
+      config:
+        - subnet: 172.20.0.0/16
