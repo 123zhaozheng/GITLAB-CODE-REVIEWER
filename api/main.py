@@ -70,6 +70,8 @@ class ReviewRequest(BaseModel):
     review_type: str = Field(default="full", description="审查类型")
     ai_model: Optional[str] = Field(default=None, description="AI模型名称")
     options: Optional[Dict[str, Any]] = Field(default_factory=dict, description="额外选项")
+    # 缓存控制：是否读取/写入缓存（历史问题与重复去重映射）。默认开启以保持兼容。
+    use_cache: bool = Field(default=True, description="是否使用缓存（历史问题/重复去重）；默认True")
 
     @field_validator('review_type')
     @classmethod
@@ -105,6 +107,11 @@ class HealthResponse(BaseModel):
     status: str
     version: str
     timestamp: str
+
+
+class TaskQueryRequest(BaseModel):
+    """任务查询请求模型"""
+    task_id: str = Field(..., description="任务ID")
 
 
 # 全局变量
@@ -179,7 +186,8 @@ async def execute_review_task(task_id: str, request: ReviewRequest):
                 target_branch=request.target_branch,
                 source_branch=request.source_branch,
                 review_type=request.review_type,
-                task_id=request.devops_task_id
+                task_id=request.devops_task_id,
+                use_cache=request.use_cache if request.use_cache is not None else True
             )
         else:
             raise ValueError(f"Invalid mode: {request.mode}")
@@ -266,7 +274,8 @@ async def review_merge_request(
                 target_branch=request.target_branch,
                 source_branch=request.source_branch,
                 review_type=request.review_type,
-                task_id=request.devops_task_id
+                task_id=request.devops_task_id,
+                use_cache=request.use_cache if request.use_cache is not None else True
             )
 
         else:
@@ -326,8 +335,8 @@ async def async_review(request: ReviewRequest, background_tasks: BackgroundTasks
             "task_id": task_id,
             "status": "pending",
             "message": "任务已提交，请使用task_id查询进度",
-            "progress_url": f"/review/{task_id}/progress",
-            "result_url": f"/review/{task_id}/result"
+            "progress_url": "/review/progress",
+            "result_url": "/review/result"
         }
 
     except Exception as e:
@@ -338,12 +347,15 @@ async def async_review(request: ReviewRequest, background_tasks: BackgroundTasks
         )
 
 
-@esb_router.get("/review/{task_id}/progress")
-async def get_task_progress(task_id: str):
+@esb_router.post("/review/progress")
+async def get_task_progress(request: TaskQueryRequest):
     """
     获取任务进度（通过 ESB）
 
     返回当前任务的执行状态和进度百分比
+
+    请求体：
+    - task_id: 任务ID
 
     返回：
     - task_id: 任务ID
@@ -355,16 +367,16 @@ async def get_task_progress(task_id: str):
     """
     try:
         task_mgr = get_task_manager()
-        task = await task_mgr.get_task(task_id)
+        task = await task_mgr.get_task(request.task_id)
 
         if not task:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"Task {task_id} not found"
+                detail=f"Task {request.task_id} not found"
             )
 
         return {
-            "task_id": task_id,
+            "task_id": request.task_id,
             "status": task.status,
             "progress": task.progress,
             "message": task.message,
@@ -382,12 +394,15 @@ async def get_task_progress(task_id: str):
         )
 
 
-@esb_router.get("/review/{task_id}/result")
-async def get_task_result(task_id: str):
+@esb_router.post("/review/result")
+async def get_task_result(request: TaskQueryRequest):
     """
     获取任务结果（通过 ESB）
 
     如果任务完成，返回完整的审查结果；否则返回当前状态
+
+    请求体：
+    - task_id: 任务ID
 
     返回：
     - 如果 completed: { task_id, status: "completed", result: {...} }
@@ -396,29 +411,29 @@ async def get_task_result(task_id: str):
     """
     try:
         task_mgr = get_task_manager()
-        task = await task_mgr.get_task(task_id)
+        task = await task_mgr.get_task(request.task_id)
 
         if not task:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"Task {task_id} not found"
+                detail=f"Task {request.task_id} not found"
             )
 
         if task.status == "completed":
             return {
-                "task_id": task_id,
+                "task_id": request.task_id,
                 "status": "completed",
                 "result": task.result
             }
         elif task.status == "failed":
             return {
-                "task_id": task_id,
+                "task_id": request.task_id,
                 "status": "failed",
                 "error": task.error
             }
         else:
             return {
-                "task_id": task_id,
+                "task_id": request.task_id,
                 "status": task.status,
                 "progress": task.progress,
                 "message": task.message

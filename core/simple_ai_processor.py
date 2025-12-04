@@ -569,7 +569,7 @@ class SimpleAIProcessor:
 
         return {
             "type": f"{review_type}_per_file",
-            "findings": all_findings[:30],  # 限制数量防止结果过大
+            "findings": all_findings[:200],  # 限制数量防止结果过大
             "suggestions": all_suggestions[:20],
             "recommendations": self._generate_recommendations(all_findings),
             "score": score,
@@ -619,7 +619,6 @@ class SimpleAIProcessor:
             analysis_time = end_time - start_time
 
             logger.info(f"✅ 文件 {file_patch.filename} 分析完成 ({analysis_time:.2f}秒)")
-            logger.info(f"    - 基础问题: {len(basic_issues)}个")
             logger.info(f"    - AI发现问题: {len(ai_findings)}个")
             logger.info(f"    - AI建议: {len(ai_suggestions)}个")
 
